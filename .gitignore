@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files
+data/
+*.csv
+*.parquet
+*.json
+
+# MinIO / storage
+minio-data/
+*.db
+
+# Logs
+*.log
+
+# Env
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid
+
+# IDE
+.vscode/
+.idea/

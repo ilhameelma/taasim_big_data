@@ -1,0 +1,288 @@
+version: "3.8"
+
+# ─────────────────────────────────────────
+#  TaaSim — Urban Mobility Platform
+#  ENSA Al Hoceima — Capstone 2025-2026
+#  Docker Compose — tous les services
+# ─────────────────────────────────────────
+
+networks:
+  taasim-net:
+    driver: bridge
+
+volumes:
+  minio-data:
+  cassandra-data:
+  grafana-data:
+
+services:
+
+  # ─────────────────────────────
+  #  1. APACHE KAFKA (KRaft mode — sans Zookeeper)
+  # ─────────────────────────────
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: taasim-kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"       # accès depuis la machine hôte
+      - "9093:9093"       # controller KRaft interne
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168       # 7 jours de rétention
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: taasim-cluster-001
+    networks:
+      - taasim-net
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ─────────────────────────────
+  #  2. MINIO (Data Lake S3-compatible)
+  # ─────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: taasim-minio
+    hostname: minio
+    ports:
+      - "9000:9000"       # API S3
+      - "9001:9001"       # Console web MinIO
+    environment:
+      MINIO_ROOT_USER: taasim
+      MINIO_ROOT_PASSWORD: taasim123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - taasim-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # Initialisation automatique des buckets MinIO
+  minio-init:
+    image: minio/mc:latest
+    container_name: taasim-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 taasim taasim123;
+        mc mb -p local/raw;
+        mc mb -p local/curated;
+        mc mb -p local/ml;
+        mc mb -p local/kafka-archive;
+        echo 'Buckets MinIO créés avec succès';
+      "
+    networks:
+      - taasim-net
+
+  # ─────────────────────────────
+  #  3. APACHE CASSANDRA
+  # ─────────────────────────────
+  cassandra:
+    image: cassandra:4.1
+    container_name: taasim-cassandra
+    hostname: cassandra
+    ports:
+      - "9042:9042"       # CQL port
+    environment:
+      CASSANDRA_CLUSTER_NAME: TaaSimCluster
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_ENDPOINT_SNITCH: SimpleSnitch
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    networks:
+      - taasim-net
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  # Initialisation du keyspace et des tables Cassandra
+  cassandra-init:
+    image: cassandra:4.1
+    container_name: taasim-cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./config/cassandra/init.cql:/init.cql
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Attente Cassandra...';
+        sleep 10;
+        cqlsh cassandra -f /init.cql;
+        echo 'Schema Cassandra initialisé';
+      "
+    networks:
+      - taasim-net
+
+  # ─────────────────────────────
+  #  4. APACHE FLINK
+  # ─────────────────────────────
+  flink-jobmanager:
+    image: flink:1.18
+    container_name: taasim-flink-jobmanager
+    hostname: flink-jobmanager
+    ports:
+      - "8081:8081"       # UI Flink
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: rocksdb
+        state.checkpoints.dir: s3://kafka-archive/flink-checkpoints/
+        s3.endpoint: http://minio:9000
+        s3.access-key: taasim
+        s3.secret-key: taasim123
+        s3.path.style.access: true
+    networks:
+      - taasim-net
+
+  flink-taskmanager:
+    image: flink:1.18
+    container_name: taasim-flink-taskmanager
+    hostname: flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: rocksdb
+        state.checkpoints.dir: s3://kafka-archive/flink-checkpoints/
+        s3.endpoint: http://minio:9000
+        s3.access-key: taasim
+        s3.secret-key: taasim123
+        s3.path.style.access: true
+    networks:
+      - taasim-net
+
+  # ─────────────────────────────
+  #  5. APACHE SPARK
+  # ─────────────────────────────
+  spark-master:
+    image: apache/spark:3.4.1
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    container_name: taasim-spark-master
+    hostname: spark-master
+    ports:
+      - "8080:8080"       # UI Spark Master
+      - "7077:7077"       # port cluster Spark
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+      # Connexion MinIO via S3A
+      SPARK_DAEMON_JAVA_OPTS: >-
+        -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000
+        -Dspark.hadoop.fs.s3a.access.key=taasim
+        -Dspark.hadoop.fs.s3a.secret.key=taasim123
+        -Dspark.hadoop.fs.s3a.path.style.access=true
+        -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+    networks:
+      - taasim-net
+
+  spark-worker:
+    image: apache/spark:3.4.1
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    container_name: taasim-spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+      SPARK_DAEMON_JAVA_OPTS: >-
+        -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000
+        -Dspark.hadoop.fs.s3a.access.key=taasim
+        -Dspark.hadoop.fs.s3a.secret.key=taasim123
+        -Dspark.hadoop.fs.s3a.path.style.access=true
+        -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+    networks:
+      - taasim-net
+
+  # ─────────────────────────────
+  #  6. JUPYTER (Notebooks Semaine 1)
+  # ─────────────────────────────
+  jupyter:
+    image: jupyter/pyspark-notebook:spark-3.4.1
+    container_name: taasim-jupyter
+    ports:
+      - "8888:8888"       # Interface Jupyter
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      SPARK_MASTER: spark://spark-master:7077
+      AWS_ACCESS_KEY_ID: taasim
+      AWS_SECRET_ACCESS_KEY: taasim123
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    volumes:
+      - ./notebooks:/home/jovyan/work/notebooks
+      - ./data:/home/jovyan/work/data
+      - ./spark-jobs:/home/jovyan/work/spark-jobs
+    networks:
+      - taasim-net
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+
+  # ─────────────────────────────
+  #  7. GRAFANA (Dashboard)
+  # ─────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: taasim-grafana
+    ports:
+      - "3000:3000"       # UI Grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: taasim123
+      GF_INSTALL_PLUGINS: hadesarchitect-cassandra-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    networks:
+      - taasim-net
+
+  # ─────────────────────────────
+  #  8. FASTAPI (Semaine 6+)
+  # ─────────────────────────────
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: taasim-api
+    ports:
+      - "8000:8000"       # API REST
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CASSANDRA_HOST: cassandra
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: taasim
+      MINIO_SECRET_KEY: taasim123
+      JWT_SECRET_KEY: taasim-jwt-secret-change-in-prod
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    networks:
+      - taasim-net
+    # Commenter ce service jusqu'à la Semaine 6
+    profiles:
+      - week6
