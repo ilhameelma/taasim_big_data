@@ -240,9 +240,16 @@ services:
       - ./data:/home/jovyan/work/data
       - ./spark-jobs:/home/jovyan/work/spark-jobs
       - ./producers:/home/jovyan/work/producers  # ← ajouter cette ligne
+      - ./requirements.txt:/home/jovyan/requirements.txt  # ← MAINTENANT À LA RACINE
     networks:
       - taasim-net
-    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+    command: >
+      sh -c "
+        if [ -f /home/jovyan/requirements.txt ]; then
+          pip install -r /home/jovyan/requirements.txt;
+        fi &&
+        start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+      "
 
   # ─────────────────────────────
   #  7. GRAFANA (Dashboard)
