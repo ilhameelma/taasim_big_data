@@ -228,7 +228,7 @@ services:
     image: jupyter/pyspark-notebook:spark-3.4.1
     container_name: taasim-jupyter
     ports:
-      - "8888:8888"       # Interface Jupyter
+      - "8888:8888"
     environment:
       JUPYTER_ENABLE_LAB: "yes"
       SPARK_MASTER: spark://spark-master:7077
@@ -239,6 +239,7 @@ services:
       - ./notebooks:/home/jovyan/work/notebooks
       - ./data:/home/jovyan/work/data
       - ./spark-jobs:/home/jovyan/work/spark-jobs
+      - ./producers:/home/jovyan/work/producers  # ← ajouter cette ligne
     networks:
       - taasim-net
     command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
