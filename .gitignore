@@ -2,33 +2,81 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pyi
+*.so
 
 # Jupyter
 .ipynb_checkpoints/
+*.ipynb_checkpoints
+# Garder les notebooks mais pas les outputs (optionnel)
+# !*.ipynb
 
 # Data files
 data/
 *.csv
 *.parquet
 *.json
+*.feather
 
 # MinIO / storage
 minio-data/
 *.db
+*.db-shm
+*.db-wal
 
 # Logs
 *.log
+*.out
+*.err
 
 # Env
 .env
+.env.local
+.venv/
+venv/
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Docker
 *.pid
+docker-compose.override.yml
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# === AJOUTS IMPORTANTS ===
+
+# JARs et gros fichiers binaires (CAUSE DE TA LENTEUR !)
+spark-jars/
+*.jar
+*.tar
+*.tar.gz
+*.zip
+backup.tar
+backup.tar.gz
+
+# Cassandra data (gros volume)
+cassandra-data/
+grafana-data/
+
+# Spark checkpoint/temp
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Kafka logs (si générés localement)
+/kafka-logs/
+
+# Fichiers temporaires Jupyter
+*.tmp
+*.bak
+
+# Producers logs (si ils génèrent des logs)
+producers/*.log
