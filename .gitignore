@@ -54,7 +54,7 @@ docker-compose.override.yml
 # === AJOUTS IMPORTANTS ===
 
 # JARs et gros fichiers binaires (CAUSE DE TA LENTEUR !)
-spark-jars/
+
 *.jar
 *.tar
 *.tar.gz
