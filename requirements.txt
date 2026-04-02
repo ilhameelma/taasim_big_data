@@ -7,6 +7,8 @@ kafka-python>=2.0.2
 # Data processing
 pandas>=1.5.0
 numpy>=1.24.0
+numexpr>=2.10.2  
+bottleneck>=1.4.2 
 
 # Visualisation (notebooks)
 matplotlib>=3.7.0

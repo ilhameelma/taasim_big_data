@@ -42,7 +42,7 @@ services:
     networks:
       - taasim-net
     healthcheck:
-      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 5
@@ -186,18 +186,27 @@ services:
     container_name: taasim-spark-master
     hostname: spark-master
     ports:
-      - "8080:8080"       # UI Spark Master
-      - "7077:7077"       # port cluster Spark
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark-jars:/opt/spark/jars/extras        # ✔ correct
     environment:
       SPARK_MODE: master
       SPARK_MASTER_HOST: spark-master
-      # Connexion MinIO via S3A
+
       SPARK_DAEMON_JAVA_OPTS: >-
         -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000
         -Dspark.hadoop.fs.s3a.access.key=taasim
         -Dspark.hadoop.fs.s3a.secret.key=taasim123
         -Dspark.hadoop.fs.s3a.path.style.access=true
         -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+
+        # ✔ Spark doit charger les jars externes
+        -Dspark.driver.extraClassPath=/opt/spark/jars/extras/*
+        -Dspark.executor.extraClassPath=/opt/spark/jars/extras/*
+
+        # ✔ pour être sûr que Spark les utilise
+        -Dspark.jars=/opt/spark/jars/extras/*
     networks:
       - taasim-net
 
@@ -207,17 +216,25 @@ services:
     container_name: taasim-spark-worker
     depends_on:
       - spark-master
+    volumes:
+      - ./spark-jars:/opt/spark/jars/extras        # ✔ correct
     environment:
       SPARK_MODE: worker
       SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_MEMORY: 2G
       SPARK_WORKER_CORES: 2
+
       SPARK_DAEMON_JAVA_OPTS: >-
         -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000
         -Dspark.hadoop.fs.s3a.access.key=taasim
         -Dspark.hadoop.fs.s3a.secret.key=taasim123
         -Dspark.hadoop.fs.s3a.path.style.access=true
         -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+
+        # ✔ JARs pour worker
+        -Dspark.driver.extraClassPath=/opt/spark/jars/extras/*
+        -Dspark.executor.extraClassPath=/opt/spark/jars/extras/*
+        -Dspark.jars=/opt/spark/jars/extras/*
     networks:
       - taasim-net
 
@@ -232,22 +249,36 @@ services:
     environment:
       JUPYTER_ENABLE_LAB: "yes"
       SPARK_MASTER: spark://spark-master:7077
+
       AWS_ACCESS_KEY_ID: taasim
       AWS_SECRET_ACCESS_KEY: taasim123
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+
+      # ✔ Important : Jupyter doit lancer Spark avec les JARs S3A
+      PYSPARK_SUBMIT_ARGS: >
+        --jars /home/jovyan/work/jars/* 
+        --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+        --conf spark.hadoop.fs.s3a.access.key=taasim
+        --conf spark.hadoop.fs.s3a.secret.key=taasim123
+        --conf spark.hadoop.fs.s3a.path.style.access=true
+        --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        pyspark-shell
+
     volumes:
       - ./notebooks:/home/jovyan/work/notebooks
       - ./data:/home/jovyan/work/data
       - ./spark-jobs:/home/jovyan/work/spark-jobs
-      - ./producers:/home/jovyan/work/producers  # ← ajouter cette ligne
-      - ./requirements.txt:/home/jovyan/requirements.txt  # ← MAINTENANT À LA RACINE
+      - ./producers:/home/jovyan/work/producers
+      - ./requirements.txt:/home/jovyan/requirements.txt
+
+      # ❗ Correction → les JARs doivent aller DANS /home/jovyan/work/jars/
+      - ./spark-jars:/home/jovyan/work/jars
     networks:
       - taasim-net
     command: >
       sh -c "
-        if [ -f /home/jovyan/requirements.txt ]; then
-          pip install -r /home/jovyan/requirements.txt;
-        fi &&
+        pip install --upgrade pip &&
+        pip install -r /home/jovyan/requirements.txt &&
         start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
       "
 
