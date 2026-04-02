@@ -29,3 +29,5 @@ scikit-learn>=1.3.0
 # Utilitaires
 python-dotenv>=1.0.0
 requests>=2.31.0
+boto3>=1.34.0        # ← AJOUTER CETTE LIGNE
+botocore>=1.34.0     # ← AJOUTER CETTE LIGNE
