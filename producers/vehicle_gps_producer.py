@@ -63,7 +63,7 @@ class VehicleGPSProducer:
         self.trips_df = None
         self.zone_mapping = None
         self.load_data_from_minio()
-        
+        self.load_zone_mapping()  # <--- C'est ce qui manquait !
         # Coordonnées de transformation
         self.setup_coordinate_transform()
         
@@ -108,7 +108,7 @@ class VehicleGPSProducer:
             raise
     
     def load_zone_mapping(self):
-        """Charge le mapping des zones"""
+        """Charge le mapping des zones et prépare les structures de données"""
         try:
             url = f"http://{self.minio_endpoint}/curated/zone_mapping.csv"
             response = requests.get(url, auth=(self.minio_access_key, self.minio_secret_key))
@@ -116,17 +116,40 @@ class VehicleGPSProducer:
             if response.status_code == 200:
                 self.zone_mapping = pd.read_csv(io.BytesIO(response.content))
                 logger.info(f"✅ Zone mapping chargé: {len(self.zone_mapping)} zones")
+            else:
+                raise Exception(f"HTTP {response.status_code}")
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible de charger depuis MinIO: {e}")
+            # Fallback local
+            zone_path = Path(__file__).parent.parent / 'data' / 'zone_mapping.csv'
+            if zone_path.exists():
+                self.zone_mapping = pd.read_csv(zone_path)
+                logger.info(f"✅ Zone mapping local: {len(self.zone_mapping)} zones")
+            else:
+                logger.warning("⚠️ Aucun zone_mapping trouvé, création d'un mapping par défaut")
+                self.create_default_zone_mapping()
                 return
-        except:
-            pass
+
+        # Dédupliquer pour n'avoir qu'une entrée par zone_id (les entrées 1-16 sont les bonnes)
+        self.zone_mapping = self.zone_mapping.drop_duplicates(subset=['zone_id']).copy()
         
-        # Fallback
-        zone_path = Path(__file__).parent.parent / 'data' / 'zone_mapping.csv'
-        if zone_path.exists():
-            self.zone_mapping = pd.read_csv(zone_path)
-            logger.info(f"✅ Zone mapping local: {len(self.zone_mapping)} zones")
-        else:
-            self.create_default_zone_mapping()
+        # Préparer une liste de dictionnaires pour une recherche rapide par bounding box
+        self.zones_list = []
+        for _, row in self.zone_mapping.iterrows():
+            self.zones_list.append({
+                'zone_id': int(row['zone_id']),
+                'zone_name': row['zone_name'],
+                'zone_type': row['zone_type'],
+                'base_fare_mad': float(row['base_fare_mad']),
+                'bbox': (
+                    float(row['bbox_lon_min']),
+                    float(row['bbox_lon_max']),
+                    float(row['bbox_lat_min']),
+                    float(row['bbox_lat_max'])
+                )
+            })
+        
+        logger.info(f"✅ {len(self.zones_list)} zones préparées pour recherche par bounding box")
     
     def create_default_zone_mapping(self):
         """Crée un mapping par défaut"""
@@ -153,15 +176,24 @@ class VehicleGPSProducer:
             # Position par défaut (centre de Casablanca)
             default_lat = 33.5731
             default_lon = -7.5898
-            default_zone = 8  # Zone centrale
             
+            # Obtenir les infos de zone pour la position par défaut
+            zone_info = self.get_zone_info(default_lon, default_lat)
+            
+            event_time = datetime.now()
+            
+            # Structure UNIFORMISÉE avec tous les champs
             event = {
                 "taxi_id": taxi_id,
-                "timestamp": datetime.now().isoformat(),
-                "timestamp_unix": int(datetime.now().timestamp()),
+                "timestamp": event_time.isoformat(),
+                "timestamp_unix": int(event_time.timestamp()),
                 "lat": default_lat,
                 "lon": default_lon,
-                "zone_id": default_zone,
+                "zone_id": zone_info['zone_id'],
+                "zone_name": zone_info['zone_name'],
+                "zone_type": zone_info['zone_type'],
+                "base_fare_mad": zone_info['base_fare_mad'],
+                "speed": 0.0,  # Vitesse nulle quand disponible
                 "status": "available",
                 "trip_progress": 0.0
             }
@@ -234,21 +266,38 @@ class VehicleGPSProducer:
         """Ajoute du bruit GPS (σ = 0.0002° ≈ 20m)"""
         return round(lon + np.random.normal(0, sigma), 6), round(lat + np.random.normal(0, sigma), 6)
     
-    def get_zone_id(self, lon: float, lat: float) -> int:
-        """Trouve la zone la plus proche"""
-        if self.zone_mapping is None:
-            return random.randint(1, 16)
+    def get_zone_info(self, lon: float, lat: float) -> dict:
+        """Trouve la zone contenant le point GPS basé sur sa bounding box."""
+        for zone in self.zones_list:
+            lon_min, lon_max, lat_min, lat_max = zone['bbox']
+            if lon_min <= lon <= lon_max and lat_min <= lat <= lat_max:
+                return {
+                    'zone_id': zone['zone_id'],
+                    'zone_name': zone['zone_name'],
+                    'zone_type': zone['zone_type'],
+                    'base_fare_mad': zone['base_fare_mad']
+                }
         
-        best_zone = 1
+        # Fallback: retourner la zone la plus proche si le point est hors de toutes les boxes
+        # (cela devrait être rare après votre validation à 92.5%)
+        best_zone = self.zones_list[0]
         min_dist = float('inf')
-        
-        for _, zone in self.zone_mapping.iterrows():
-            dist = ((lon - zone['centroid_lon']) ** 2 + (lat - zone['centroid_lat']) ** 2) ** 0.5
+        for zone in self.zones_list:
+            # Calculer la distance au centroïde approximatif
+            center_lon = (zone['bbox'][0] + zone['bbox'][1]) / 2
+            center_lat = (zone['bbox'][2] + zone['bbox'][3]) / 2
+            dist = ((lon - center_lon) ** 2 + (lat - center_lat) ** 2) ** 0.5
             if dist < min_dist:
                 min_dist = dist
-                best_zone = int(zone['zone_id'])
+                best_zone = zone
         
-        return best_zone
+        logger.warning(f"Point ({lon}, {lat}) hors bbox, assigné à zone {best_zone['zone_id']} par proximité")
+        return {
+            'zone_id': best_zone['zone_id'],
+            'zone_name': best_zone['zone_name'],
+            'zone_type': best_zone['zone_type'],
+            'base_fare_mad': best_zone['base_fare_mad']
+        }
     
     def init_kafka(self):
         """Initialise la connexion Kafka"""
@@ -299,7 +348,10 @@ class VehicleGPSProducer:
             # Transformation
             lon_casa, lat_casa = self.transform_coordinates(lon_porto, lat_porto)
             lon_noisy, lat_noisy = self.add_gps_noise(lon_casa, lat_casa)
-            zone_id = self.get_zone_id(lon_noisy, lat_noisy)
+            
+            # --- Utilisation de la nouvelle méthode get_zone_info ---
+            zone_info = self.get_zone_info(lon_noisy, lat_noisy)
+            # ----------------------------------------------------
             
             event_time = datetime.now()
             
@@ -310,7 +362,10 @@ class VehicleGPSProducer:
                 "timestamp_unix": int(event_time.timestamp()),
                 "lat": float(lat_noisy),
                 "lon": float(lon_noisy),
-                "zone_id": int(zone_id),
+                "zone_id": int(zone_info['zone_id']),
+                "zone_name": zone_info['zone_name'],          # Nouveau champ
+                "zone_type": zone_info['zone_type'],          # Nouveau champ
+                "base_fare_mad": float(zone_info['base_fare_mad']), # Nouveau champ
                 "speed": float(random.uniform(20, 60)),
                 "status": "moving",
                 "trip_progress": float(i / max(len(polyline), 1))
