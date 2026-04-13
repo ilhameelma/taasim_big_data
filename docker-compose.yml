@@ -101,8 +101,7 @@ services:
         mc alias set local http://minio:9000 taasim taasim123;
         mc mb -p local/raw;
         mc mb -p local/curated;
-        mc mb -p local/ml;
-        mc mb -p local/kafka-archive;
+        mc mb -p local/machine-learning;
         echo 'Buckets MinIO créés avec succès';
       "
     networks:
