@@ -46,6 +46,24 @@ services:
       interval: 15s
       timeout: 10s
       retries: 5
+  # ─────────────────────────────
+#  INITIALISATION KAFKA (Topics)
+# ─────────────────────────────
+  # ─────────────────────────────
+#  INITIALISATION KAFKA (Topics)
+# ─────────────────────────────
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: taasim-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    entrypoint: /bin/sh -c "echo '⏳ Attente du démarrage de Kafka...'; sleep 10; echo '📝 Création des topics Kafka...'; /opt/kafka/bin/kafka-topics.sh --create --topic raw.trips --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --if-not-exists; /opt/kafka/bin/kafka-topics.sh --create --topic raw.gps --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --if-not-exists; /opt/kafka/bin/kafka-topics.sh --create --topic processed.gps --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --if-not-exists; /opt/kafka/bin/kafka-topics.sh --create --topic processed.demand --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --if-not-exists; /opt/kafka/bin/kafka-topics.sh --create --topic processed.matches --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --if-not-exists; echo ''; echo '✅ Topics Kafka créés avec succès !'; echo ''; echo '📋 Liste des topics disponibles:'; /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server kafka:9092; echo ''; echo '🏁 Initialisation terminée.'; exit 0;"
+    networks:
+      - taasim-net
+    restart: "no"
 
   # ─────────────────────────────
   #  2. MINIO (Data Lake S3-compatible)
