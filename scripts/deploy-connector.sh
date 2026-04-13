@@ -16,6 +16,13 @@ done
 
 echo '✅ Plugin S3 trouvé'
 
+# Supprimer l'ancien connecteur s'il existe
+if curl -s -f http://kafka-connect:8083/connectors/s3-sink-taasim > /dev/null; then
+  echo '⚠️ Connecteur existant trouvé, suppression...'
+  curl -X DELETE http://kafka-connect:8083/connectors/s3-sink-taasim
+  sleep 2
+fi
+
 echo '📝 Déploiement du connecteur S3...'
 curl -X POST http://kafka-connect:8083/connectors \
   -H 'Content-Type: application/json' \
