@@ -6,6 +6,8 @@ Selon specs du projet: page 19 - Simule des réservations citoyens
 Utilise les courbes de demande générées par le notebook:
 - demand_curve_hourly.json: demande par heure (normalisée entre 0 et 1)
 - demand_curve_daily.json: demande par jour de semaine (normalisée entre 0 et 1)
+
+Utilise zone_mapping_geojson.csv avec la colonne prefecture comme nom de zone
 """
 
 import json
@@ -53,7 +55,6 @@ class TripRequestProducer:
             with open(hourly_path, 'r') as f:
                 self.demand_hourly = json.load(f)
             logger.info(f"Courbe horaire chargée: {len(self.demand_hourly)} heures")
-            # Convertir les clés en int si nécessaire
             self.demand_hourly = {int(k): v for k, v in self.demand_hourly.items()}
         else:
             logger.warning(f"demand_curve_hourly.json non trouvé, utilisation des valeurs par défaut")
@@ -71,16 +72,14 @@ class TripRequestProducer:
             with open(daily_path, 'r') as f:
                 self.demand_daily = json.load(f)
             logger.info(f"Courbe journalière chargée: {len(self.demand_daily)} jours")
-            # Convertir les clés en int si nécessaire
             self.demand_daily = {int(k): v for k, v in self.demand_daily.items()}
         else:
             logger.warning(f"demand_curve_daily.json non trouvé, utilisation des valeurs par défaut")
-            # 0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi, 5=Samedi, 6=Dimanche
             self.demand_daily = {
                 0: 0.83, 1: 0.85, 2: 0.84, 3: 0.89, 4: 1.0, 5: 0.93, 6: 0.83
             }
         
-        # Normaliser les valeurs pour qu'elles soient entre 0 et 1
+        # Normaliser les valeurs
         max_hourly = max(self.demand_hourly.values())
         self.demand_hourly = {h: v / max_hourly for h, v in self.demand_hourly.items()}
         
@@ -90,117 +89,106 @@ class TripRequestProducer:
         logger.info("Courbes de demande normalisées (valeurs entre 0 et 1)")
         
     def load_zone_mapping(self):
-        """Charge la table des zones Casablanca avec toutes les nouvelles colonnes"""
-        zone_path = self.data_path / 'zone_mapping.csv'
-        if zone_path.exists():
-            self.zones_df = pd.read_csv(zone_path)
-            # Utiliser toutes les colonnes disponibles
-            self.zones = self.zones_df.to_dict('records')
-            logger.info(f"Zones chargées: {len(self.zones)}")
-            logger.info(f"Colonnes disponibles: {list(self.zones_df.columns)}")
-            
-            # Afficher quelques statistiques sur les zones
-            if 'population_density' in self.zones_df.columns:
-                # Compter les valeurs uniques de densité
-                densities = self.zones_df['population_density'].unique()
-                logger.info(f"Population density values: {list(densities)}")
-            if 'base_fare_mad' in self.zones_df.columns:
-                logger.info(f"Base fare - min: {self.zones_df['base_fare_mad'].min()} MAD, max: {self.zones_df['base_fare_mad'].max()} MAD")
+        """Charge la table des zones depuis zone_mapping_geojson.csv"""
+        # Essayer d'abord le nouveau fichier
+        zone_path_geojson = self.data_path / 'zone_mapping_geojson.csv'
+        zone_path_old = self.data_path / 'zone_mapping.csv'
+        
+        if zone_path_geojson.exists():
+            self.zones_df = pd.read_csv(zone_path_geojson)
+            logger.info(f"✅ Zones chargées depuis zone_mapping_geojson.csv: {len(self.zones_df)} zones")
+        elif zone_path_old.exists():
+            self.zones_df = pd.read_csv(zone_path_old)
+            logger.info(f"⚠️ Zones chargées depuis zone_mapping.csv (ancien): {len(self.zones_df)} zones")
         else:
-            logger.warning(f"zone_mapping.csv non trouvé dans {zone_path}")
-            self.zones = [{'zone_id': i, 'zone_type': 'mixed'} for i in range(1, 17)]
+            logger.error(f"❌ Aucun fichier zone_mapping trouvé")
+            self.zones = [{'zone_id': i, 'zone_type': 'mixed', 'zone_name': f'Zone_{i}'} for i in range(1, 17)]
+            return
+
+        # Vérifier les colonnes disponibles
+        logger.info(f"Colonnes disponibles: {list(self.zones_df.columns)}")
+        
+        # Préparer les zones pour la sélection
+        self.zones = []
+        
+        # Si le fichier a la colonne 'prefecture', l'utiliser comme zone_name
+        if 'prefecture' in self.zones_df.columns:
+            for _, row in self.zones_df.iterrows():
+                zone = {
+                    'zone_id': int(row['zone_id']),
+                    'zone_name': str(row['prefecture']),  # ← Utilise prefecture
+                    'zone_type': str(row.get('zone_type', 'mixed')),
+                    'base_fare_mad': float(row.get('base_fare_mad', 8.0)),
+                    'population': row.get('population', 0),
+                    'superficie_m2': row.get('superficie_m2', 0)
+                }
+                self.zones.append(zone)
+            logger.info(f"✅ {len(self.zones)} zones chargées (avec prefecture comme nom)")
+        else:
+            # Fallback: utiliser les colonnes existantes
+            for _, row in self.zones_df.iterrows():
+                zone = {
+                    'zone_id': int(row['zone_id']),
+                    'zone_name': str(row.get('zone_name', f"Zone_{row['zone_id']}")),
+                    'zone_type': str(row.get('zone_type', 'mixed')),
+                    'base_fare_mad': float(row.get('base_fare_mad', 8.0))
+                }
+                self.zones.append(zone)
+            logger.info(f"⚠️ {len(self.zones)} zones chargées (sans prefecture)")
+        
+        # Afficher les zones pour vérification
+        logger.info("📋 ZONES DISPONIBLES:")
+        for zone in self.zones[:10]:
+            logger.info(f"   Zone {zone['zone_id']}: {zone['zone_name']} ({zone['zone_type']}) - {zone['base_fare_mad']} MAD")
+        if len(self.zones) > 10:
+            logger.info(f"   ... et {len(self.zones)-10} autres zones")
+        
+        # Statistiques sur les tarifs
+        if self.zones:
+            fares = [z['base_fare_mad'] for z in self.zones]
+            logger.info(f"Tarifs: min={min(fares)} MAD, max={max(fares)} MAD, moyenne={sum(fares)/len(fares):.1f} MAD")
     
     def get_demand_multiplier(self, current_time):
-        """
-        Calcule le multiplicateur de demande basé sur:
-        - L'heure de la journée (demand_curve_hourly.json)
-        - Le jour de la semaine (demand_curve_daily.json)
-        
-        Returns:
-            float: multiplicateur de demande (entre 0 et 1)
-        """
+        """Calcule le multiplicateur de demande"""
         hour = current_time.hour
-        # Python: 0=Lundi, 1=Mardi, ..., 6=Dimanche
-        # Notre fichier daily.json utilise 0=Lundi, 6=Dimanche (même convention)
         day_of_week = current_time.weekday()
         
-        # Obtenir les facteurs
         hourly_factor = self.demand_hourly.get(hour, 0.5)
         daily_factor = self.demand_daily.get(day_of_week, 0.8)
         
-        # Combiner les deux facteurs (moyenne pondérée)
-        # On donne plus de poids à l'heure qu'au jour
         combined_factor = (hourly_factor * 0.7 + daily_factor * 0.3)
         
         return combined_factor
     
-    def convert_density_to_score(self, density_value):
-        """
-        Convertit la densité de population textuelle en score numérique
-        
-        Args:
-            density_value: 'high', 'medium', 'low' ou None
-            
-        Returns:
-            float: score entre 0.5 et 2.0
-        """
-        if density_value is None or pd.isna(density_value):
-            return 1.0
-        
-        density_str = str(density_value).lower()
-        
-        density_scores = {
-            'high': 1.5,
-            'medium': 1.0,
-            'low': 0.6,
-            'very high': 1.8,
-            'very low': 0.4
-        }
-        
-        return density_scores.get(density_str, 1.0)
-    
     def get_zone_weight(self, zone):
-        """
-        Calcule le poids d'une zone pour la sélection (zones plus denses = plus de demandes)
-        
-        Args:
-            zone: dictionnaire contenant les informations de la zone
-            
-        Returns:
-            float: poids de la zone (plus élevé = plus de chance d'être sélectionnée)
-        """
-        # Base weight = 1
+        """Calcule le poids d'une zone pour la sélection"""
         weight = 1.0
         
-        # Ajuster selon la densité de population (maintenant gère les strings)
-        if 'population_density' in zone and zone['population_density'] is not None:
-            weight *= self.convert_density_to_score(zone['population_density'])
-        
         # Ajuster selon le type de zone
-        if 'zone_type' in zone:
-            zone_type = str(zone['zone_type']).lower()
-            if zone_type == 'commercial':
-                weight *= 1.3  # Zones commerciales plus actives
-            elif zone_type == 'residential':
-                weight *= 0.8  # Zones résidentielles moins actives
-            elif zone_type == 'industrial':
-                weight *= 0.6  # Zones industrielles peu actives
-            elif zone_type == 'transit_hub':
-                weight *= 1.5  # Hubs de transport très actifs
+        zone_type = str(zone.get('zone_type', 'mixed')).lower()
+        if zone_type == 'commercial':
+            weight *= 1.3
+        elif zone_type == 'residential':
+            weight *= 0.8
+        elif zone_type == 'industrial':
+            weight *= 0.6
+        elif zone_type == 'transit_hub':
+            weight *= 1.5
         
-        return max(0.3, min(weight, 3.0))  # Limiter entre 0.3 et 3.0
+        # Ajuster selon la population (si disponible)
+        if 'population' in zone and zone['population']:
+            try:
+                pop = float(zone['population'])
+                # Normaliser la population (max ~500000)
+                pop_factor = min(1.5, max(0.5, pop / 250000))
+                weight *= pop_factor
+            except:
+                pass
+        
+        return max(0.3, min(weight, 3.0))
     
     def select_weighted_zone(self, exclude_zone=None):
-        """
-        Sélectionne une zone aléatoire avec un poids basé sur sa densité et son type
-        
-        Args:
-            exclude_zone: ID de zone à exclure (pour éviter origine = destination)
-            
-        Returns:
-            dict: zone sélectionnée
-        """
-        # Calculer les poids pour chaque zone
+        """Sélectionne une zone aléatoire avec un poids"""
         eligible_zones = []
         weights = []
         
@@ -210,66 +198,55 @@ class TripRequestProducer:
             eligible_zones.append(zone)
             weights.append(self.get_zone_weight(zone))
         
-        # Sélectionner avec les poids
+        if not eligible_zones:
+            return self.zones[0]
+        
         selected = random.choices(eligible_zones, weights=weights, k=1)[0]
         return selected
     
     def get_call_type(self, hour):
-        """
-        Distribution CALL_TYPE basée sur l'heure
-        - A (dispatché): plus fréquent aux heures de pointe
-        - B (station): constant
-        - C (rue): plus fréquent le soir et le week-end
-        """
-        # Ajuster les probabilités selon l'heure
+        """Distribution CALL_TYPE basée sur l'heure"""
         if 7 <= hour <= 9 or 17 <= hour <= 19:
-            # Heures de pointe: plus de dispatchés
             weights = [0.4, 0.3, 0.3]  # A, B, C
         elif 20 <= hour <= 23:
-            # Soir: plus de rue
             weights = [0.2, 0.3, 0.5]
         elif 0 <= hour <= 5:
-            # Nuit: plus de station
             weights = [0.2, 0.5, 0.3]
         else:
-            # Jour normal: distribution standard
             weights = [0.3, 0.3, 0.4]
         
         return random.choices(['A', 'B', 'C'], weights=weights)[0]
     
     def create_trip_request(self, current_time):
-        """Crée un message de réservation selon specs page 19"""
-        # Calculer le multiplicateur de demande
+        """Crée un message de réservation"""
         demand_multiplier = self.get_demand_multiplier(current_time)
-        
-        # Base rate = 1 réservation par seconde au max
         base_rate = demand_multiplier * self.speed_factor
         
-        # Sélectionner les zones avec pondération
         origin_zone = self.select_weighted_zone()
         destination_zone = self.select_weighted_zone(exclude_zone=origin_zone['zone_id'])
         
-        # Calculer le prix estimé (si les données sont disponibles)
+        # Calculer le prix estimé
         estimated_fare = None
         if 'base_fare_mad' in origin_zone and 'base_fare_mad' in destination_zone:
             try:
                 base_fare = (float(origin_zone.get('base_fare_mad', 5)) + 
                             float(destination_zone.get('base_fare_mad', 5))) / 2
-                # Ajouter un facteur aléatoire
                 estimated_fare = round(base_fare + random.uniform(-2, 5), 2)
-                estimated_fare = max(5, estimated_fare)  # Minimum 5 MAD
+                estimated_fare = max(5, estimated_fare)
             except (ValueError, TypeError):
-                estimated_fare = 8.0  # Valeur par défaut
+                estimated_fare = 8.0
         
-        # Créer le message
+        # Créer le message avec prefecture comme zone_name
         request = {
             "trip_id": str(uuid.uuid4()),
             "rider_id": f"rider_{random.randint(1, 10000)}",
             "origin_zone": origin_zone['zone_id'],
-            "origin_zone_name": origin_zone.get('zone_name', 'Unknown'),
+            "origin_zone_name": origin_zone.get('zone_name', 'Unknown'),  # ← prefecture
             "origin_zone_type": origin_zone.get('zone_type', 'mixed'),
+            "origin_prefecture": origin_zone.get('zone_name', 'Unknown'),  # ← champ explicite
             "destination_zone": destination_zone['zone_id'],
-            "destination_zone_name": destination_zone.get('zone_name', 'Unknown'),
+            "destination_zone_name": destination_zone.get('zone_name', 'Unknown'),  # ← prefecture
+            "destination_prefecture": destination_zone.get('zone_name', 'Unknown'),  # ← champ explicite
             "destination_zone_type": destination_zone.get('zone_type', 'mixed'),
             "requested_at": current_time.isoformat(),
             "call_type": self.get_call_type(current_time.hour),
@@ -277,19 +254,13 @@ class TripRequestProducer:
             "demand_multiplier": round(demand_multiplier, 3)
         }
         
-        # Ajouter le prix estimé si disponible
         if estimated_fare:
             request["estimated_fare_mad"] = estimated_fare
-        
-        # Ajouter la densité de population si disponible (convertie en score)
-        if 'population_density' in origin_zone:
-            density_score = self.convert_density_to_score(origin_zone.get('population_density'))
-            request["origin_density_score"] = density_score
         
         return request, base_rate
     
     def run(self, duration_seconds=None):
-        """Lance la simulation (page 19)"""
+        """Lance la simulation"""
         start_time = datetime.now()
         end_time = start_time + timedelta(seconds=duration_seconds) if duration_seconds else None
         
@@ -307,11 +278,7 @@ class TripRequestProducer:
                 if end_time and current_time >= end_time:
                     break
                 
-                # Créer et envoyer un message
                 request, base_rate = self.create_trip_request(current_time)
-                
-                # Ajuster le délai selon la demande
-                # base_rate est le nombre de réservations par seconde
                 delay = 1.0 / max(base_rate, 0.1)
                 
                 self.producer.send('raw.trips', request)
@@ -354,11 +321,11 @@ Exemples:
     parser.add_argument('--bootstrap-servers', default='kafka:9092',
                         help='Adresse du broker Kafka')
     parser.add_argument('--data-path', default=None,
-                        help='Chemin vers les données (contient zone_mapping.csv et demand_curve_*.json)')
+                        help='Chemin vers les données')
     parser.add_argument('--speed-factor', type=float, default=1.0,
-                        help='Facteur d\'accélération (défaut: 1.0 = temps réel)')
+                        help='Facteur d\'accélération')
     parser.add_argument('--duration', type=int, default=None,
-                        help='Durée de simulation en secondes (défaut: infini)')
+                        help='Durée de simulation en secondes')
     
     args = parser.parse_args()
     
