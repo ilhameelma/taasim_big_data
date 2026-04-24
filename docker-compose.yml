@@ -325,17 +325,18 @@ services:
   jupyter:
     image: jupyter/pyspark-notebook:spark-3.4.1
     container_name: taasim-jupyter
+                          
     ports:
       - "8888:8888"
     environment:
       JUPYTER_ENABLE_LAB: "yes"
+      GRANT_SUDO: "yes"                 # ← AJOUTER CETTE LIGNE
+      NB_USER: "jovyan"                 # ← AJOUTER CETTE LIGNE
+      CHOWN_HOME: "yes"                 # ← AJOUTER CETTE LIGNE
       SPARK_MASTER: spark://spark-master:7077
-
       AWS_ACCESS_KEY_ID: taasim
       AWS_SECRET_ACCESS_KEY: taasim123
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
-
-      # ✔ Important : Jupyter doit lancer Spark avec les JARs S3A
       PYSPARK_SUBMIT_ARGS: >
         --jars /home/jovyan/work/jars/* 
         --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
@@ -344,20 +345,20 @@ services:
         --conf spark.hadoop.fs.s3a.path.style.access=true
         --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
         pyspark-shell
-
     volumes:
       - ./notebooks:/home/jovyan/work/notebooks
       - ./data:/home/jovyan/work/data
       - ./spark-jobs:/home/jovyan/work/spark-jobs
       - ./producers:/home/jovyan/work/producers
       - ./requirements.txt:/home/jovyan/requirements.txt
-
-      # ❗ Correction → les JARs doivent aller DANS /home/jovyan/work/jars/
       - ./spark-jars:/home/jovyan/work/jars
     networks:
       - taasim-net
     command: >
       sh -c "
+        mkdir -p /home/jovyan/work/producers &&
+        chmod -R 777 /home/jovyan/work/notebooks || true &&
+        chmod -R 777 /home/jovyan/work/producers || true &&
         pip install --upgrade pip &&
         pip install -r /home/jovyan/requirements.txt &&
         start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
