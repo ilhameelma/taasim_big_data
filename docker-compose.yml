@@ -219,45 +219,73 @@ services:
   #  4. APACHE FLINK
   # ─────────────────────────────
   flink-jobmanager:
-    image: flink:1.18
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
     container_name: taasim-flink-jobmanager
     hostname: flink-jobmanager
     ports:
-      - "8081:8081"       # UI Flink
+      - "8081:8081"
+    volumes:
+      - ./data:/opt/flink/data
+    
     command: jobmanager
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
         state.backend: rocksdb
-        state.checkpoints.dir: s3://kafka-archive/flink-checkpoints/
+        # CORRECTION : utiliser raw/kafka-archive au lieu de kafka-archive
+        state.checkpoints.dir: s3://raw/kafka-archive/flink-checkpoints/
         s3.endpoint: http://minio:9000
         s3.access-key: taasim
         s3.secret-key: taasim123
         s3.path.style.access: true
+        execution.checkpointing.interval: 60000
+        # Désactiver SSL pour MinIO
+        s3.connection.ssl.enabled: false
+        # Configuration Hadoop S3A
+        fs.s3a.endpoint: http://minio:9000
+        fs.s3a.access.key: taasim
+        fs.s3a.secret.key: taasim123
+        fs.s3a.path.style.access: true
+        fs.s3a.connection.ssl.enabled: false
+        fs.s3a.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
     networks:
       - taasim-net
 
   flink-taskmanager:
-    image: flink:1.18
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
     container_name: taasim-flink-taskmanager
     hostname: flink-taskmanager
     depends_on:
       - flink-jobmanager
+    volumes:
+      - ./data:/opt/flink/data
     command: taskmanager
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
         state.backend: rocksdb
-        state.checkpoints.dir: s3://kafka-archive/flink-checkpoints/
+        # CORRECTION : utiliser raw/kafka-archive au lieu de kafka-archive
+        state.checkpoints.dir: s3://raw/kafka-archive/flink-checkpoints/
         s3.endpoint: http://minio:9000
         s3.access-key: taasim
         s3.secret-key: taasim123
         s3.path.style.access: true
+        execution.checkpointing.interval: 60000
+        s3.connection.ssl.enabled: false
+        fs.s3a.endpoint: http://minio:9000
+        fs.s3a.access.key: taasim
+        fs.s3a.secret.key: taasim123
+        fs.s3a.path.style.access: true
+        fs.s3a.connection.ssl.enabled: false
+        fs.s3a.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
     networks:
       - taasim-net
-
   # ─────────────────────────────
   #  5. APACHE SPARK
   # ─────────────────────────────
@@ -350,6 +378,7 @@ services:
       - ./data:/home/jovyan/work/data
       - ./spark-jobs:/home/jovyan/work/spark-jobs
       - ./producers:/home/jovyan/work/producers
+      - ./flink:/home/jovyan/work/flink
       - ./requirements.txt:/home/jovyan/requirements.txt
       - ./spark-jars:/home/jovyan/work/jars
     networks:
