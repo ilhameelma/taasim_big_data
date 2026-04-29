@@ -1,0 +1,7 @@
+[smtp]
+enabled = true
+host = smtp.gmail.com:587
+user = tonemail@gmail.com
+password = "mot_de_passe_application"
+from_address = tonemail@gmail.com
+from_name = Grafana Alerts

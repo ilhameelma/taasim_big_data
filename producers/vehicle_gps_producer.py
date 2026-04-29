@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 TaaSim - Vehicle GPS Producer
-Rejoue les polylines GPS du dataset Porto à travers Kafka
-AVEC ROAD SNAPPING OSMnx SUR UN ÉCHANTILLON CONFIGURABLE (défaut: 500 trajets)
+Lit les fichiers Parquet déjà remappés (Porto → Casablanca) et rejoue les polylines à travers Kafka
+AVEC ROAD SNAPPING OSMnx (optionnel)
 """
 
 import json
@@ -22,6 +22,8 @@ import requests
 
 import boto3
 from botocore.client import Config
+import pyarrow.parquet as pq
+import pyarrow as pa
 
 from shapely.geometry import Point, Polygon
 
@@ -55,10 +57,6 @@ class RoadSnapEngine:
     """
     Charge le graphe routier de Casablanca via OSMnx et snape chaque point
     GPS sur l'arête la plus proche du réseau drive.
-
-    Usage:
-        engine = RoadSnapEngine(bbox=(lon_min, lon_max, lat_min, lat_max))
-        lon_s, lat_s = engine.snap(lon, lat)
     """
 
     def __init__(
@@ -67,13 +65,6 @@ class RoadSnapEngine:
         cache_path: Optional[str] = None,
         network_type: str = "drive",
     ):
-        """
-        Parameters
-        ----------
-        bbox        : (lon_min, lon_max, lat_min, lat_max) en WGS84
-        cache_path  : chemin .graphml pour éviter de re-télécharger le graphe
-        network_type: type de réseau OSMnx ('drive', 'walk', 'bike'…)
-        """
         self._ready = False
         self._graph = None
         self._nodes = None
@@ -85,14 +76,10 @@ class RoadSnapEngine:
         self.snap_stats = {
             "total": 0,
             "snapped": 0,
-            "fallback": 0,    # point hors zone ou erreur
+            "fallback": 0,
         }
 
         self._load_graph()
-
-    # ------------------------------------------------------------------
-    # Chargement du graphe
-    # ------------------------------------------------------------------
 
     def _load_graph(self):
         """Charge le graphe depuis le cache ou le télécharge via OSMnx."""
@@ -108,7 +95,6 @@ class RoadSnapEngine:
 
         lon_min, lon_max, lat_min, lat_max = self.bbox
 
-        # --- Essai depuis le cache ---
         if self.cache_path and self.cache_path.exists():
             logger.info(f"📂 Chargement du graphe depuis le cache: {self.cache_path}")
             try:
@@ -119,14 +105,13 @@ class RoadSnapEngine:
             except Exception as e:
                 logger.warning(f"⚠️ Cache invalide ({e}), re-téléchargement…")
 
-        # --- Téléchargement depuis OSM ---
         logger.info(
             f"🌍 Téléchargement du réseau routier Casablanca "
             f"[{lat_min:.4f},{lat_max:.4f},{lon_min:.4f},{lon_max:.4f}]…"
         )
         try:
             self._graph = ox.graph_from_bbox(
-                bbox=(lat_max, lat_min, lon_max, lon_min),   # (north,south,east,west) en lat/lon
+                bbox=(lat_max, lat_min, lon_max, lon_min),
                 network_type=self.network_type,
                 simplify=True,
             )
@@ -135,7 +120,6 @@ class RoadSnapEngine:
                 f"{len(self._graph.nodes)} nœuds, {len(self._graph.edges)} arêtes"
             )
 
-            # Sauvegarde cache
             if self.cache_path:
                 self.cache_path.parent.mkdir(parents=True, exist_ok=True)
                 ox.save_graphml(self._graph, str(self.cache_path))
@@ -147,24 +131,15 @@ class RoadSnapEngine:
             logger.error(f"❌ Impossible de charger le graphe OSMnx: {e}")
 
     def _post_load(self, ox):
-        """Prépare les structures de données après chargement du graphe."""
         import geopandas as gpd
         self._nodes, self._edges = ox.graph_to_gdfs(self._graph)
         self._ready = True
         logger.info("✅ RoadSnapEngine prêt")
 
-    # ------------------------------------------------------------------
-    # Snap d'un point GPS
-    # ------------------------------------------------------------------
-
     def snap(self, lon: float, lat: float) -> Tuple[float, float, bool]:
         """
         Snape un point GPS sur le réseau routier.
-
-        Returns
-        -------
-        (lon_snapped, lat_snapped, was_snapped)
-        was_snapped=False si le moteur n'est pas prêt ou si une erreur survient.
+        Returns (lon_snapped, lat_snapped, was_snapped)
         """
         self.snap_stats["total"] += 1
 
@@ -174,19 +149,16 @@ class RoadSnapEngine:
 
         try:
             import osmnx as ox
+            from shapely.geometry import LineString
 
-            # Trouver l'arête la plus proche
             nearest_edge = ox.nearest_edges(self._graph, lon, lat)
             u, v, key = nearest_edge
 
-            # Récupérer la géométrie de l'arête
             edge_data = self._graph.edges[u, v, key]
 
             if "geometry" in edge_data:
                 line = edge_data["geometry"]
             else:
-                # Construire une LineString depuis les nœuds u et v
-                from shapely.geometry import LineString
                 u_data = self._graph.nodes[u]
                 v_data = self._graph.nodes[v]
                 line = LineString([
@@ -194,7 +166,6 @@ class RoadSnapEngine:
                     (v_data["x"], v_data["y"]),
                 ])
 
-            # Projeter le point sur la ligne
             point = Point(lon, lat)
             projected = line.interpolate(line.project(point))
 
@@ -206,16 +177,12 @@ class RoadSnapEngine:
             self.snap_stats["fallback"] += 1
             return lon, lat, False
 
-    # ------------------------------------------------------------------
-    # Stats
-    # ------------------------------------------------------------------
-
     def print_stats(self):
         total = self.snap_stats["total"]
         if total == 0:
             logger.info("RoadSnapEngine: aucun point traité.")
             return
-        snapped  = self.snap_stats["snapped"]
+        snapped = self.snap_stats["snapped"]
         fallback = self.snap_stats["fallback"]
         logger.info("=" * 60)
         logger.info("🛣️  STATISTIQUES ROAD SNAPPING")
@@ -231,7 +198,11 @@ class RoadSnapEngine:
 # ---------------------------------------------------------------------------
 
 class VehicleGPSProducer:
-    """Producer GPS qui simule des véhicules en mouvement."""
+    """
+    Producer GPS qui lit les fichiers Parquet déjà remappés
+    (trajets Porto → Casablanca transformés)
+    et simule des véhicules en mouvement.
+    """
 
     def __init__(
         self,
@@ -240,52 +211,55 @@ class VehicleGPSProducer:
         minio_endpoint: str = "minio:9000",
         minio_access_key: str = "taasim",
         minio_secret_key: str = "taasim123",
+        curated_bucket: str = "curated",
+        curated_prefix: str = "porto-trips",
         geojson_path: str = "/home/jovyan/work/data/Arrondissements.geojson",
         # --- Paramètres Road Snapping ---
         snap_sample_size: int = 500,
         snap_graph_cache: str = "/tmp/casablanca_drive.graphml",
         enable_road_snap: bool = True,
         # --- Limite mémoire ---
-        max_rows: int = 5000,
+        max_trips: int = 5000,
     ):
         self.bootstrap_servers = bootstrap_servers
         self.speed_factor = speed_factor
-        self.max_rows = max_rows
+        self.max_trips = max_trips
 
         # --- Road Snapping ---
         self.snap_sample_size = snap_sample_size
         self.snap_graph_cache = snap_graph_cache
         self.enable_road_snap = enable_road_snap
-        self.snapped_trip_ids: set = set()   # TAXI_ID des trajets snappés
+        self.snapped_trip_ids: set = set()
         self.road_snap_engine: Optional[RoadSnapEngine] = None
 
         # Configuration MinIO
         self.minio_endpoint = minio_endpoint
         self.minio_access_key = minio_access_key
         self.minio_secret_key = minio_secret_key
-        self.minio_bucket = "raw"
-        self.minio_object = "porto-trips/train.csv"
+        self.curated_bucket = curated_bucket
+        self.curated_prefix = curated_prefix
 
-        # Statistiques de validation
-        self.validation_stats = {
-            "total_points": 0,
-            "valid_points": 0,
-            "invalid_points": 0,
-            "projected_points": 0,
-        }
-
-        # Chargement des données
+        # Chargement des données (Parquet déjà remappé)
         self.trips_df = None
         self.zone_mapping = None
         self.zones_list = []
-        self.load_data_from_minio()
+        
+        # Chargement des trajets depuis Parquet
+        self.load_trips_from_parquet()
+        
+        # Chargement du mapping des zones
         self.load_zone_mapping()
 
         # GeoJSON Casablanca
+        self.casa_polygon = None
         self.load_geojson(geojson_path)
-
-        # Transformation coordonnées
-        self.setup_coordinate_transform()
+        
+        # Bbox Casablanca (depuis les données chargées)
+        self.casa_lon_min = None
+        self.casa_lon_max = None
+        self.casa_lat_min = None
+        self.casa_lat_max = None
+        self.compute_casa_bbox()
 
         # Road Snapping — sélectionner l'échantillon et charger le graphe
         if self.enable_road_snap:
@@ -302,60 +276,24 @@ class VehicleGPSProducer:
         # Stats globales
         self.total_events = 0
         self.blackout_events = 0
+        
+        # Stats validation
+        self.validation_stats = {
+            "total_points": 0,
+            "invalid_points": 0,
+            "projected_points": 0,
+        }
 
     # -----------------------------------------------------------------------
-    # Road Snapping — initialisation
+    # Chargement des trajets depuis Parquet (DÉJÀ REMAPPÉS)
     # -----------------------------------------------------------------------
 
-    def _init_road_snap(self):
+    def load_trips_from_parquet(self):
         """
-        Sélectionne aléatoirement `snap_sample_size` trajets parmi ceux disponibles
-        et charge le graphe OSMnx pour Casablanca.
+        Lit les fichiers Parquet depuis S3/MinIO.
+        Ces fichiers contiennent déjà les trajets remappés (Porto → Casablanca)
+        avec les colonnes: trip_id, taxi_id, snapped_polyline, origin_zone_id, ...
         """
-        if self.trips_df is None or len(self.trips_df) == 0:
-            logger.warning("⚠️ Pas de données chargées — road snapping désactivé.")
-            self.enable_road_snap = False
-            return
-
-        n_available = len(self.trips_df)
-        n_snap = min(self.snap_sample_size, n_available)
-
-        # Sélection aléatoire reproductible
-        sampled_indices = self.trips_df.sample(n=n_snap, random_state=42).index
-        self.snapped_trip_ids = set(
-            self.trips_df.loc[sampled_indices, "TAXI_ID"].astype(int).tolist()
-        )
-
-        logger.info("=" * 60)
-        logger.info(f"🛣️  ROAD SNAPPING activé sur {n_snap}/{n_available} trajets")
-        logger.info(f"   Cache graphe : {self.snap_graph_cache}")
-        logger.info("=" * 60)
-
-        self.road_snap_engine = RoadSnapEngine(
-            bbox=(
-                self.casa_lon_min,
-                self.casa_lon_max,
-                self.casa_lat_min,
-                self.casa_lat_max,
-            ),
-            cache_path=self.snap_graph_cache,
-            network_type="drive",
-        )
-
-    def should_snap(self, taxi_id: int) -> bool:
-        """Retourne True si ce taxi fait partie de l'échantillon snappé."""
-        return (
-            self.enable_road_snap
-            and self.road_snap_engine is not None
-            and self.road_snap_engine._ready
-            and taxi_id in self.snapped_trip_ids
-        )
-
-    # -----------------------------------------------------------------------
-    # Chargement des données
-    # -----------------------------------------------------------------------
-
-    def load_data_from_minio(self):
         try:
             s3_client = boto3.client(
                 "s3",
@@ -365,17 +303,111 @@ class VehicleGPSProducer:
                 config=Config(signature_version="s3v4"),
                 region_name="us-east-1",
             )
-            response = s3_client.get_object(
-                Bucket=self.minio_bucket,
-                Key=self.minio_object,
-            )
-            self.trips_df = pd.read_csv(response["Body"], nrows=self.max_rows)
-            logger.info(f"✅ Données chargées: {len(self.trips_df)} trajets (limite: {self.max_rows})")
+            
+            # Lister les fichiers Parquet dans le bucket curated/porto-trips/
+            paginator = s3_client.get_paginator('list_objects_v2')
+            parquet_files = []
+            
+            for page in paginator.paginate(Bucket=self.curated_bucket, Prefix=self.curated_prefix):
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        if obj['Key'].endswith('.parquet'):
+                            parquet_files.append(obj['Key'])
+            
+            if not parquet_files:
+                raise Exception(f"Aucun fichier .parquet trouvé dans s3://{self.curated_bucket}/{self.curated_prefix}/")
+            
+            logger.info(f"📁 Trouvé {len(parquet_files)} fichiers Parquet")
+            
+            # Lire et concaténer les DataFrames
+            dfs = []
+            total_rows = 0
+            
+            for file_key in parquet_files[:10]:  # Limiter pour éviter OOM
+                logger.info(f"   Lecture: {file_key}")
+                response = s3_client.get_object(Bucket=self.curated_bucket, Key=file_key)
+                
+                # Lire le Parquet avec pyarrow
+                table = pq.read_table(io.BytesIO(response['Body'].read()))
+                df = table.to_pandas()
+                dfs.append(df)
+                total_rows += len(df)
+                
+                if total_rows >= self.max_trips:
+                    break
+            
+            if not dfs:
+                raise Exception("Aucune donnée lue depuis les fichiers Parquet")
+            
+            self.trips_df = pd.concat(dfs, ignore_index=True)
+            
+            # Limiter au nombre max de trajets
+            if len(self.trips_df) > self.max_trips:
+                self.trips_df = self.trips_df.head(self.max_trips)
+            
+            logger.info(f"✅ Trajets chargés: {len(self.trips_df)} trajets (limite: {self.max_trips})")
+            logger.info(f"   Colonnes disponibles: {list(self.trips_df.columns)}")
+            
+            # Vérifier la colonne de polyline
+            polyline_col = None
+            for col in ['snapped_polyline', 'polyline', 'remapped_polyline']:
+                if col in self.trips_df.columns:
+                    polyline_col = col
+                    break
+            
+            if polyline_col is None:
+                raise Exception(f"Aucune colonne de polyline trouvée dans les colonnes: {list(self.trips_df.columns)}")
+            
+            logger.info(f"   Utilisation de la colonne: '{polyline_col}' pour les polylines")
+            
+            # Renommer pour uniformiser
+            if polyline_col != 'POLYLINE':
+                self.trips_df['POLYLINE'] = self.trips_df[polyline_col]
+                
+            # S'assurer que TAXI_ID existe
+            if 'taxi_id' in self.trips_df.columns and 'TAXI_ID' not in self.trips_df.columns:
+                self.trips_df['TAXI_ID'] = self.trips_df['taxi_id']
+            
         except Exception as e:
-            logger.error(f"❌ Erreur MinIO: {e}")
+            logger.error(f"❌ Erreur chargement Parquet: {e}")
             raise
 
+    def compute_casa_bbox(self):
+        """Calcule la bbox de Casablanca depuis les polylines chargées."""
+        if self.trips_df is None or len(self.trips_df) == 0:
+            # Valeurs par défaut
+            self.casa_lon_min = -7.7000
+            self.casa_lon_max = -7.4800
+            self.casa_lat_min = 33.4800
+            self.casa_lat_max = 33.6800
+            logger.warning("⚠️ Utilisation des valeurs par défaut pour la bbox Casablanca")
+            return
+        
+        lon_min, lon_max, lat_min, lat_max = float('inf'), float('-inf'), float('inf'), float('-inf')
+        
+        for _, row in self.trips_df.iterrows():
+            try:
+                polyline = json.loads(row['POLYLINE'])
+                for lon, lat in polyline:
+                    lon_min = min(lon_min, lon)
+                    lon_max = max(lon_max, lon)
+                    lat_min = min(lat_min, lat)
+                    lat_max = max(lat_max, lat)
+            except:
+                continue
+        
+        if lon_min != float('inf'):
+            self.casa_lon_min = lon_min
+            self.casa_lon_max = lon_max
+            self.casa_lat_min = lat_min
+            self.casa_lat_max = lat_max
+        
+        logger.info(f"📍 Bbox Casablanca calculée: "
+                   f"lon [{self.casa_lon_min:.4f}, {self.casa_lon_max:.4f}], "
+                   f"lat [{self.casa_lat_min:.4f}, {self.casa_lat_max:.4f}]")
+
     def load_zone_mapping(self):
+        """Charge le mapping des zones depuis MinIO ou fichier local."""
         try:
             url = f"http://{self.minio_endpoint}/curated/zone_mapping_geojson.csv"
             response = requests.get(
@@ -383,9 +415,7 @@ class VehicleGPSProducer:
             )
             if response.status_code == 200:
                 self.zone_mapping = pd.read_csv(io.BytesIO(response.content))
-                logger.info(
-                    f"✅ Zone mapping chargé depuis MinIO: {len(self.zone_mapping)} zones"
-                )
+                logger.info(f"✅ Zone mapping chargé depuis MinIO: {len(self.zone_mapping)} zones")
             else:
                 raise Exception(f"HTTP {response.status_code}")
         except Exception as e:
@@ -393,9 +423,7 @@ class VehicleGPSProducer:
             zone_path = Path(__file__).parent.parent / "data" / "zone_mapping_geojson.csv"
             if zone_path.exists():
                 self.zone_mapping = pd.read_csv(zone_path)
-                logger.info(
-                    f"✅ Zone mapping chargé localement: {len(self.zone_mapping)} zones"
-                )
+                logger.info(f"✅ Zone mapping chargé localement: {len(self.zone_mapping)} zones")
             else:
                 logger.error("❌ Aucun fichier zone_mapping_geojson.csv trouvé")
                 self.zone_mapping = None
@@ -430,54 +458,72 @@ class VehicleGPSProducer:
                 logger.warning(f"⚠️ Erreur ligne {_}: {ex}")
 
         logger.info(f"✅ {len(self.zones_list)} zones préparées")
-        logger.info("📋 ZONES CHARGÉES:")
-        for z in self.zones_list[:5]:
-            logger.info(
-                f"   Zone {z['zone_id']}: {z['zone_name']} "
-                f"({z['zone_type']}) - {z['base_fare_mad']} MAD"
-            )
 
     def load_geojson(self, geojson_path: str):
-        import geopandas as gpd
         try:
+            import geopandas as gpd
             gdf = gpd.read_file(geojson_path)
             self.casa_polygon = gdf.union_all()
-            logger.info("✅ GeoJSON chargé pour transformation avancée")
+            logger.info("✅ GeoJSON chargé pour validation des points")
         except Exception as e:
             logger.warning(f"⚠️ Impossible de charger le GeoJSON: {e}")
             self.casa_polygon = None
 
     # -----------------------------------------------------------------------
-    # Transformation des coordonnées
+    # Road Snapping — initialisation
     # -----------------------------------------------------------------------
 
-    def setup_coordinate_transform(self):
-        self.porto_lon_min = -8.7327
-        self.porto_lon_max = -8.5539
-        self.porto_lat_min = 41.0527
-        self.porto_lat_max = 41.2370
+    def _init_road_snap(self):
+        """Sélectionne un échantillon de trajets pour le road snapping."""
+        if self.trips_df is None or len(self.trips_df) == 0:
+            logger.warning("⚠️ Pas de données chargées — road snapping désactivé.")
+            self.enable_road_snap = False
+            return
 
-        self.casa_lon_min = -7.7000
-        self.casa_lon_max = -7.4800
-        self.casa_lat_min = 33.4800
-        self.casa_lat_max = 33.6800
+        n_available = len(self.trips_df)
+        n_snap = min(self.snap_sample_size, n_available)
 
-        logger.info("📍 Transformation Porto → Casablanca configurée")
+        # Sélection aléatoire reproductible
+        sampled_indices = self.trips_df.sample(n=n_snap, random_state=42).index
+        self.snapped_trip_ids = set(
+            self.trips_df.loc[sampled_indices, "TAXI_ID"].astype(int).tolist()
+        )
 
-    def linear_map(self, value, src_min, src_max, dst_min, dst_max):
-        ratio = (value - src_min) / (src_max - src_min)
-        return dst_min + ratio * (dst_max - dst_min)
+        logger.info("=" * 60)
+        logger.info(f"🛣️  ROAD SNAPPING activé sur {n_snap}/{n_available} trajets")
+        logger.info(f"   Cache graphe : {self.snap_graph_cache}")
+        logger.info("=" * 60)
 
-    def porto_to_casa_linear(self, lon: float, lat: float) -> Tuple[float, float]:
-        lon_c = self.linear_map(lon, self.porto_lon_min, self.porto_lon_max,
-                                self.casa_lon_min, self.casa_lon_max)
-        lat_c = self.linear_map(lat, self.porto_lat_min, self.porto_lat_max,
-                                self.casa_lat_min, self.casa_lat_max)
-        return lon_c, lat_c
+        self.road_snap_engine = RoadSnapEngine(
+            bbox=(
+                self.casa_lon_min,
+                self.casa_lon_max,
+                self.casa_lat_min,
+                self.casa_lat_max,
+            ),
+            cache_path=self.snap_graph_cache,
+            network_type="drive",
+        )
 
-    def transform_coordinates(self, lon_porto: float, lat_porto: float) -> Tuple[float, float]:
-        lon_c, lat_c = self.porto_to_casa_linear(lon_porto, lat_porto)
-        return round(lon_c, 6), round(lat_c, 6)
+    def should_snap(self, taxi_id: int) -> bool:
+        return (
+            self.enable_road_snap
+            and self.road_snap_engine is not None
+            and self.road_snap_engine._ready
+            and taxi_id in self.snapped_trip_ids
+        )
+
+    # -----------------------------------------------------------------------
+    # Transformation (minimale car déjà remappé)
+    # -----------------------------------------------------------------------
+
+    def parse_polyline(self, polyline_str: str) -> List[Tuple[float, float]]:
+        """Parse une polyline JSON en liste de points (lon, lat)."""
+        try:
+            points = json.loads(polyline_str)
+            return [(float(p[0]), float(p[1])) for p in points]
+        except Exception:
+            return []
 
     def is_point_in_casablanca(self, lon: float, lat: float) -> bool:
         in_bbox = (
@@ -510,7 +556,6 @@ class VehicleGPSProducer:
         )
 
     def apply_noise_and_project(self, lon: float, lat: float) -> Tuple[float, float]:
-        """Bruit GPS + projection dans le polygone + comptage stats."""
         lon_noisy, lat_noisy = self.add_gps_noise(lon, lat)
         lon_final, lat_final, was_projected = self.project_inside_casa_polygon(
             lon_noisy, lat_noisy
@@ -520,10 +565,7 @@ class VehicleGPSProducer:
 
         if was_projected:
             self.validation_stats["projected_points"] += 1
-            self.validation_stats["valid_points"] += 1
-        elif self.is_point_in_casablanca(lon_final, lat_final):
-            self.validation_stats["valid_points"] += 1
-        else:
+        elif not self.is_point_in_casablanca(lon_final, lat_final):
             self.validation_stats["invalid_points"] += 1
 
         return round(lon_final, 6), round(lat_final, 6)
@@ -551,7 +593,7 @@ class VehicleGPSProducer:
                     "base_fare_mad": zone["base_fare_mad"],
                 }
 
-        # Fallback: zone la plus proche par centroïde
+        # Fallback: zone la plus proche
         best_zone = self.zones_list[0]
         min_dist = float("inf")
         for zone in self.zones_list:
@@ -592,13 +634,6 @@ class VehicleGPSProducer:
     # -----------------------------------------------------------------------
     # Simulation
     # -----------------------------------------------------------------------
-
-    def parse_polyline(self, polyline_str: str) -> List[Tuple[float, float]]:
-        try:
-            points = json.loads(polyline_str)
-            return [(float(p[0]), float(p[1])) for p in points]
-        except Exception:
-            return []
 
     def should_blackout(self) -> bool:
         return random.random() < 0.05
@@ -650,11 +685,8 @@ class VehicleGPSProducer:
 
     def simulate_vehicle_trip(self, trip_row: pd.Series):
         """
-        Simule un véhicule sur un trajet.
-
-        Si le taxi fait partie de l'échantillon snappé, chaque point GPS
-        est projeté sur le réseau routier OSMnx après la transformation
-        Porto → Casa et avant l'envoi Kafka.
+        Simule un véhicule sur un trajet DÉJÀ REMAPPÉ.
+        La polyline est déjà dans l'espace de Casablanca.
         """
         taxi_id = int(trip_row["TAXI_ID"])
         polyline = self.parse_polyline(trip_row["POLYLINE"])
@@ -670,7 +702,7 @@ class VehicleGPSProducer:
             f"({len(polyline)} points, snap={'oui' if use_snap else 'non'})"
         )
 
-        for i, (lon_porto, lat_porto) in enumerate(polyline):
+        for i, (lon, lat) in enumerate(polyline):
             if not self.active_vehicles.get(taxi_id, {}).get("active", True):
                 break
 
@@ -684,13 +716,10 @@ class VehicleGPSProducer:
                 time.sleep(blackout_duration / self.speed_factor)
                 continue
 
-            # 1. Transformation linéaire Porto → Casa
-            lon_casa, lat_casa = self.transform_coordinates(lon_porto, lat_porto)
+            # 1. Bruit + projection dans le polygone
+            lon_noisy, lat_noisy = self.apply_noise_and_project(lon, lat)
 
-            # 2. Bruit + projection dans le polygone
-            lon_noisy, lat_noisy = self.apply_noise_and_project(lon_casa, lat_casa)
-
-            # 3. Road Snapping (seulement pour l'échantillon sélectionné)
+            # 2. Road Snapping (optionnel)
             road_snapped = False
             if use_snap and self.road_snap_engine is not None:
                 lon_final, lat_final, road_snapped = self.road_snap_engine.snap(
@@ -699,7 +728,7 @@ class VehicleGPSProducer:
             else:
                 lon_final, lat_final = lon_noisy, lat_noisy
 
-            # 4. Zone
+            # 3. Zone
             zone_info = self.get_zone_info(lon_final, lat_final)
 
             if i == 0:
@@ -728,7 +757,6 @@ class VehicleGPSProducer:
                 "speed": float(random.uniform(20, 60)),
                 "status": "moving",
                 "trip_progress": float(i / max(len(polyline), 1)),
-                # Champs road snapping
                 "road_snapped": road_snapped,
                 "snap_applied": use_snap,
             }
@@ -782,9 +810,10 @@ class VehicleGPSProducer:
             return
 
         logger.info("=" * 60)
-        logger.info("🚕 TaaSim - Vehicle GPS Producer (avec Road Snapping)")
+        logger.info("🚕 TaaSim - Vehicle GPS Producer")
         logger.info(f"📊 Speed factor       : {self.speed_factor}x")
         logger.info(f"🚗 Max vehicles        : {max_vehicles}")
+        logger.info(f"📊 Trajets disponibles : {len(self.trips_df)}")
         logger.info(
             f"🛣️  Road snap activé   : {'oui' if self.enable_road_snap else 'non'}"
         )
@@ -848,22 +877,16 @@ class VehicleGPSProducer:
     def print_validation_stats(self):
         total = self.validation_stats["total_points"]
         if total == 0:
-            logger.info("Aucun point GPS transformé — pas de stats.")
+            logger.info("Aucun point GPS traité — pas de stats.")
             return
 
-        valid     = self.validation_stats["valid_points"]
-        invalid   = self.validation_stats["invalid_points"]
+        invalid = self.validation_stats["invalid_points"]
         projected = self.validation_stats["projected_points"]
-
-        assert valid + invalid == total, (
-            f"ERREUR comptage: valid({valid}) + invalid({invalid}) != total({total})"
-        )
 
         logger.info("=" * 60)
         logger.info("📊 STATISTIQUES DE VALIDATION GPS")
         logger.info("=" * 60)
         logger.info(f"   Total points transformés   : {total}")
-        logger.info(f"   Points valides (polygone)  : {valid}     ({valid/total*100:.1f}%)")
         logger.info(f"   Points invalides (hors bbox): {invalid}   ({invalid/total*100:.1f}%)")
         logger.info(f"   Points projetés (corrigés) : {projected}  ({projected/total*100:.1f}%)")
 
@@ -872,9 +895,7 @@ class VehicleGPSProducer:
                 f"⚠️ ATTENTION: {invalid/total*100:.1f}% des points sont hors de Casablanca!"
             )
         else:
-            logger.info(
-                f"✅ VALIDATION OK: {valid/total*100:.1f}% des points sont dans Casablanca."
-            )
+            logger.info(f"✅ VALIDATION OK: {(total-invalid)/total*100:.1f}% des points sont dans Casablanca.")
         logger.info("=" * 60)
 
     def cleanup(self):
@@ -906,7 +927,7 @@ class VehicleGPSProducer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="TaaSim Vehicle GPS Producer (avec Road Snapping)"
+        description="TaaSim Vehicle GPS Producer (lit les trajets déjà remappés depuis Parquet)"
     )
     parser.add_argument("--bootstrap-servers", default="kafka:9092")
     parser.add_argument("--speed-factor", type=float, default=10.0)
@@ -916,17 +937,21 @@ def main():
     parser.add_argument("--minio-endpoint", default="minio:9000")
     parser.add_argument("--minio-access-key", default="taasim")
     parser.add_argument("--minio-secret-key", default="taasim123")
+    parser.add_argument("--curated-bucket", default="curated",
+                        help="Bucket contenant les trajets remappés")
+    parser.add_argument("--curated-prefix", default="porto-trips",
+                        help="Préfixe du dossier Parquet")
     parser.add_argument("--geojson-path",
                         default="/home/jovyan/work/data/Arrondissements.geojson")
     # Road Snapping
     parser.add_argument("--snap-sample-size", type=int, default=500,
-                        help="Nombre de trajets à snapper sur le réseau routier (défaut: 500)")
+                        help="Nombre de trajets à snapper sur le réseau routier")
     parser.add_argument("--snap-graph-cache", default="/tmp/casablanca_drive.graphml",
-                        help="Chemin du cache GraphML OSMnx pour Casablanca")
+                        help="Chemin du cache GraphML OSMnx")
     parser.add_argument("--no-road-snap", action="store_true",
                         help="Désactive complètement le road snapping")
-    parser.add_argument("--max-rows", type=int, default=5000,
-                        help="Nombre max de trajets à charger depuis MinIO (défaut: 5000, évite OOM)")
+    parser.add_argument("--max-trips", type=int, default=5000,
+                        help="Nombre max de trajets à charger depuis Parquet")
 
     args = parser.parse_args()
 
@@ -936,11 +961,13 @@ def main():
         minio_endpoint=args.minio_endpoint,
         minio_access_key=args.minio_access_key,
         minio_secret_key=args.minio_secret_key,
+        curated_bucket=args.curated_bucket,
+        curated_prefix=args.curated_prefix,
         geojson_path=args.geojson_path,
         snap_sample_size=args.snap_sample_size,
         snap_graph_cache=args.snap_graph_cache,
         enable_road_snap=not args.no_road_snap,
-        max_rows=args.max_rows,
+        max_trips=args.max_trips,
     )
 
     producer.run(duration_seconds=args.duration, max_vehicles=args.max_vehicles)
