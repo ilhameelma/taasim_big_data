@@ -1,0 +1,17 @@
+pour lancer le   producers de reservation 
+    docker exec -it taasim-jupyter python /home/jovyan/work/producers/trip_request_producer.py --speed-factor 2.0
+pour lancer le producers de gps
+    docker exec -it taasim-jupyter python -u /home/jovyan/work/producers/vehicle_gps_producer.py --snap-sample-size 500 --snap-graph-cache /home/jovyan/work/data/casa_graph.graphml --geojson-path /home/jovyan/work/data/Arrondissements.geojson --max-vehicles 20  --minio-endpoint minio:9000 --bootstrap-servers kafka:9092 2>&1
+
+pour lancer flik job 1`
+    copies dans opt/flink
+    docker cp flink/flink_job1_gps_normalizer.py taasim-flink-jobmanager:/opt/flink/
+    puis lancer avec 
+    docker exec -it taasim-flink-jobmanager flink run -py /opt/flink/flink_job1_gps_normalizer.py 
+pour lancer flink job2
+    copies dans opt/flink
+    docker cp flink/flink_job2_demand_aggregator.py taasim-flink-jobmanager:/opt/flink/flink_job2_demand_aggregator.py
+    puis lancer avec 
+    docker exec -it taasim-flink-jobmanager flink run -py /opt/flink/flink_job2_demand_aggregator.py
+pour voir est ce que kafka contient des message 
+    docker exec -it taasim-kafka /opt/kafka/bin/kafka-console-consumer.sh --topic raw.gps --bootstrap-server localhost:9092 --from-beginning --max-messages 10
