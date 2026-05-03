@@ -294,7 +294,7 @@ def main():
 
     print("=" * 70)
     print("🚀 TaaSim — Flink Job 2 — Demand Aggregator COMPLET")
-    print(f"   ✅ Sources: raw.gps (GPS) + raw.trips (Trip Requests)")
+    print(f"   ✅ Sources: processed.gps (GPS) + raw.trips (Trip Requests)")
     print(f"   ✅ Fenêtre tumbling: {WINDOW_SECONDS}s")
     print("=" * 70)
 
@@ -307,7 +307,7 @@ def main():
     # Source GPS
     gps_source = (KafkaSource.builder()
         .set_bootstrap_servers(KAFKA_BROKERS)
-        .set_topics("raw.gps")
+        .set_topics("processed.gps")
         .set_group_id("flink-job2-gps")
         .set_starting_offsets(KafkaOffsetsInitializer.latest())
         .set_value_only_deserializer(SimpleStringSchema())
