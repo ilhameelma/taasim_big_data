@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: 'TaaSim Dashboards'
+    orgId: 1
+    folder: 'TaaSim'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: true

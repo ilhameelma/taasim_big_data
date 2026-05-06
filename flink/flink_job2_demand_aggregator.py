@@ -13,9 +13,32 @@ from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common import WatermarkStrategy, Types, Duration
 from pyflink.datastream.functions import MapFunction, FilterFunction, FlatMapFunction
 
+
 # Configuration
 CASA_LON_MIN, CASA_LON_MAX = -7.78, -7.40
 CASA_LAT_MIN, CASA_LAT_MAX = 33.48, 33.70
+# Ajoutez ce dictionnaire dans Job 2 (au début du fichier)
+ZONE_CENTROIDS = {
+    1: (33.5799, -7.6052),
+    2: (33.5835, -7.6813),
+    3: (33.5463, -7.6804),
+    4: (33.5891, -7.4994),
+    5: (33.5661, -7.5405),
+    6: (33.5568, -7.5607),
+    7: (33.5545, -7.5813),
+    8: (33.5363, -7.5590),
+    9: (33.5268, -7.6217),
+    10: (33.5652, -7.5949),
+    11: (33.5765, -7.6021),
+    12: (33.5856, -7.5831),
+    13: (33.5894, -7.5654),
+    14: (33.6040, -7.5446),
+    15: (33.6200, -7.5038),
+    16: (33.5704, -7.6325),
+    17: (33.5982, -7.6159),
+}
+
+
 CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "cassandra")
 CASSANDRA_PORT = int(os.getenv("CASSANDRA_PORT", "9042"))
 KEYSPACE       = "taasim"
@@ -125,6 +148,8 @@ class UnifiedWindowAggregator(FlatMapFunction):
             "n_trips": 0,
             "name": "Inconnu",
             "zone_type": "unknown",
+            "lat": 0.0,
+            "lon": 0.0,
             "min_ts": None,
             "max_ts": None
         })
@@ -142,7 +167,11 @@ class UnifiedWindowAggregator(FlatMapFunction):
             zone_type = value[7]
             
             z = self._zones[zone_id]
-            
+            if z["lat"] == 0.0 and z["lon"] == 0.0:
+              coords = ZONE_CENTROIDS.get(zone_id, (33.57, -7.58))
+              z["lat"] = coords[0]
+              z["lon"] = coords[1]
+
             if event_type == "gps":
                 z["moving"] += moving
                 z["available"] += available
@@ -199,6 +228,8 @@ class UnifiedWindowAggregator(FlatMapFunction):
                     "supply_demand_ratio": supply_demand_ratio,
                     "forecast_demand":     0.0,
                     "avg_wait_time_sec":   0.0,
+                    "lat":                 z["lat"],   # ← AJOUTER
+                    "lon":                 z["lon"],
                     "demand_score":        score,
                     "total_gps_events":    z["n_gps"],
                     "total_trip_events":   z["n_trips"],
@@ -208,6 +239,8 @@ class UnifiedWindowAggregator(FlatMapFunction):
                 "moving": 0, "available": 0, "pending": 0,
                 "n_gps": 0, "n_trips": 0,
                 "name": "Inconnu", "zone_type": "unknown",
+                "lat": 0.0,      # 🆕 AJOUT
+                "lon": 0.0,      # 🆕 AJOUT
                 "min_ts": None, "max_ts": None
             })
             self._last_window = current_window
@@ -254,8 +287,9 @@ class CassandraDemandSink(MapFunction):
             INSERT INTO demand_zones
                 (city, zone_id, window_start,
                  active_vehicles, pending_requests, completed_trips,
-                 supply_demand_ratio, forecast_demand, avg_wait_time_sec)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 supply_demand_ratio, forecast_demand, avg_wait_time_sec,
+                 lat, lon)                       
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)   
         """)
         print("✅ CASSANDRA SINK READY → demand_zones")
 
@@ -273,6 +307,8 @@ class CassandraDemandSink(MapFunction):
                 float(r["supply_demand_ratio"]),
                 float(r["forecast_demand"]),
                 float(r["avg_wait_time_sec"]),
+                float(r["lat"]),
+                float(r["lon"])
             ))
             print(f"✅ CASSANDRA: zone {r['zone_id']} | pending={r['pending_requests']} ratio={r['supply_demand_ratio']:.3f}")
         except Exception as e:

@@ -83,6 +83,8 @@ CREATE TABLE IF NOT EXISTS demand_zones (
     active_vehicles int,          -- Nombre de véhicules actifs
     pending_requests int,         -- Demandes en attente
     completed_trips int,          -- Trajets complétés dans la fenêtre
+    lat double,                    -- ← AJOUTER
+    lon double,  
     supply_demand_ratio double,   -- Ratio offre/demande (vehicles/requests)
     forecast_demand double,       -- Prédiction ML (optionnel)
     avg_wait_time_sec double,     -- Temps d'attente moyen
