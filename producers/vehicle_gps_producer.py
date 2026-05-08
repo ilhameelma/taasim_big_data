@@ -3,6 +3,9 @@
 TaaSim - Vehicle GPS Producer
 Lit les fichiers Parquet déjà remappés (Porto → Casablanca) et rejoue les polylines à travers Kafka
 AVEC ROAD SNAPPING OSMnx (optionnel)
+
+FIX: end_event contient lat/lon/zone_id complets pour que le taxi
+     repasse dans le pool "available" du matcher après chaque trajet.
 """
 
 import json
@@ -375,7 +378,6 @@ class VehicleGPSProducer:
     def compute_casa_bbox(self):
         """Calcule la bbox de Casablanca depuis les polylines chargées."""
         if self.trips_df is None or len(self.trips_df) == 0:
-            # Valeurs par défaut
             self.casa_lon_min = -7.7000
             self.casa_lon_max = -7.4800
             self.casa_lat_min = 33.4800
@@ -483,7 +485,6 @@ class VehicleGPSProducer:
         n_available = len(self.trips_df)
         n_snap = min(self.snap_sample_size, n_available)
 
-        # Sélection aléatoire reproductible
         sampled_indices = self.trips_df.sample(n=n_snap, random_state=42).index
         self.snapped_trip_ids = set(
             self.trips_df.loc[sampled_indices, "TAXI_ID"].astype(int).tolist()
@@ -514,7 +515,7 @@ class VehicleGPSProducer:
         )
 
     # -----------------------------------------------------------------------
-    # Transformation (minimale car déjà remappé)
+    # Transformation
     # -----------------------------------------------------------------------
 
     def parse_polyline(self, polyline_str: str) -> List[Tuple[float, float]]:
@@ -686,7 +687,10 @@ class VehicleGPSProducer:
     def simulate_vehicle_trip(self, trip_row: pd.Series):
         """
         Simule un véhicule sur un trajet DÉJÀ REMAPPÉ.
-        La polyline est déjà dans l'espace de Casablanca.
+        
+        FIX: Mémorise la dernière position valide (lon_final, lat_final, zone_info)
+             pour envoyer un end_event complet avec lat/lon/zone_id,
+             ce qui permet au taxi de réintégrer le pool "available" du matcher.
         """
         taxi_id = int(trip_row["TAXI_ID"])
         polyline = self.parse_polyline(trip_row["POLYLINE"])
@@ -701,6 +705,11 @@ class VehicleGPSProducer:
             f"{snap_label} Véhicule {taxi_id} démarre trajet "
             f"({len(polyline)} points, snap={'oui' if use_snap else 'non'})"
         )
+
+        # ─── FIX: initialiser last_* AVANT la boucle ───────────────────────
+        last_lon, last_lat = polyline[0][0], polyline[0][1]
+        last_zone = self.get_zone_info(last_lon, last_lat)
+        # ────────────────────────────────────────────────────────────────────
 
         for i, (lon, lat) in enumerate(polyline):
             if not self.active_vehicles.get(taxi_id, {}).get("active", True):
@@ -773,22 +782,43 @@ class VehicleGPSProducer:
             except Exception as e:
                 logger.error(f"Erreur envoi taxi {taxi_id}: {e}")
 
+            # ─── FIX: mémoriser la dernière position valide ─────────────────
+            last_lon, last_lat = lon_final, lat_final
+            last_zone = zone_info
+            # ────────────────────────────────────────────────────────────────
+
             time.sleep(15.0 / self.speed_factor)
 
-        logger.info(f"🏁 Véhicule {taxi_id} termine son trajet")
+        logger.info(f"🏁 Véhicule {taxi_id} termine son trajet — repasse en available")
 
+        # ─── FIX: end_event COMPLET avec lat/lon/zone_id de la dernière position ──
+        # Sans ces champs, Job1 filtre l'event et le taxi ne réintègre jamais
+        # le pool "available" du matcher (Job3).
         end_event = {
             "taxi_id": taxi_id,
             "timestamp": datetime.now().isoformat(),
             "timestamp_unix": int(datetime.now().timestamp()),
-            "status": "available",
+            "lat": float(last_lat),                      # ← FIX: dernière position connue
+            "lon": float(last_lon),                      # ← FIX: dernière position connue
+            "zone_id": int(last_zone["zone_id"]),        # ← FIX: zone d'arrivée
+            "zone_name": last_zone["zone_name"],         # ← FIX: nom de zone
+            "zone_type": last_zone["zone_type"],         # ← FIX: type de zone
+            "prefecture": last_zone["zone_name"],        # ← FIX: préfecture
+            "base_fare_mad": float(last_zone["base_fare_mad"]),  # ← FIX: tarif
+            "speed": 0.0,                                # ← vitesse nulle (arrêté)
+            "status": "available",                       # ← réintègre le pool
             "trip_progress": 1.0,
             "road_snapped": False,
             "snap_applied": use_snap,
         }
+        # ────────────────────────────────────────────────────────────────────────
 
         try:
             self.producer.send("raw.gps", key=taxi_id, value=end_event)
+            logger.info(
+                f"✅ Taxi {taxi_id} → available | Zone {last_zone['zone_id']} "
+                f"({last_zone['zone_name']}) | lon={last_lon:.4f} lat={last_lat:.4f}"
+            )
         except Exception as e:
             logger.error(f"Erreur fin trajet taxi {taxi_id}: {e}")
 
@@ -943,15 +973,10 @@ def main():
                         help="Préfixe du dossier Parquet")
     parser.add_argument("--geojson-path",
                         default="/home/jovyan/work/data/Arrondissements.geojson")
-    # Road Snapping
-    parser.add_argument("--snap-sample-size", type=int, default=500,
-                        help="Nombre de trajets à snapper sur le réseau routier")
-    parser.add_argument("--snap-graph-cache", default="/tmp/casablanca_drive.graphml",
-                        help="Chemin du cache GraphML OSMnx")
-    parser.add_argument("--no-road-snap", action="store_true",
-                        help="Désactive complètement le road snapping")
-    parser.add_argument("--max-trips", type=int, default=5000,
-                        help="Nombre max de trajets à charger depuis Parquet")
+    parser.add_argument("--snap-sample-size", type=int, default=500)
+    parser.add_argument("--snap-graph-cache", default="/tmp/casablanca_drive.graphml")
+    parser.add_argument("--no-road-snap", action="store_true")
+    parser.add_argument("--max-trips", type=int, default=5000)
 
     args = parser.parse_args()
 

@@ -1,5 +1,5 @@
 pour lancer le   producers de reservation 
-    docker exec -it taasim-jupyter python /home/jovyan/work/producers/trip_request_producer.py --speed-factor 2.0
+    docker exec -it taasim-jupyter python /home/jovyan/work/producers/trip_request_producer.py --speed-factor 0.2
 pour lancer le producers de gps
     docker exec -it taasim-jupyter python -u /home/jovyan/work/producers/vehicle_gps_producer.py --snap-sample-size 500 --snap-graph-cache /home/jovyan/work/data/casa_graph.graphml --geojson-path /home/jovyan/work/data/Arrondissements.geojson --max-vehicles 20  --minio-endpoint minio:9000 --bootstrap-servers kafka:9092 2>&1
 

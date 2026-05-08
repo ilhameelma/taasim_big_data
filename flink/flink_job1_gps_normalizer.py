@@ -45,10 +45,16 @@ class ValidEvent(FilterFunction):
     def filter(self, event):
         if event is None:
             return False
-        required = ["taxi_id", "timestamp_unix", "lat", "lon", "status"]
+        required = ["taxi_id", "timestamp_unix", "status"]
         if not all(k in event for k in required):
             return False
-        return is_in_casablanca_bbox(event.get("lon"), event.get("lat"))
+        
+        # Si lat/lon présents, vérifier la bbox
+        if "lat" in event and "lon" in event:
+            return is_in_casablanca_bbox(event.get("lon"), event.get("lat"))
+        
+        # Event sans lat/lon (fin de trajet) → laisser passer si available
+        return event.get("status") == "available"
 
 # ============================================================
 # 3. Zone mapping + Anonymisation
@@ -115,7 +121,16 @@ class ZoneMappingFunction(MapFunction):
     def map(self, event):
         lon = event.get("lon")
         lat = event.get("lat")
-        zone = self.get_zone(lon, lat)
+        
+        # Si pas de coordonnées, utiliser le centroïde de Casablanca par défaut
+        if lon is None or lat is None:
+            event["zone_id"]       = event.get("zone_id", 1)
+            event["zone_name"]     = event.get("zone_name", "Unknown")
+            event["zone_type"]     = event.get("zone_type", "mixed")
+            event["base_fare_mad"] = event.get("base_fare_mad", 8.0)
+            event["lat"]           = 33.5731
+            event["lon"]           = -7.5898
+            return event
         if zone:
             event["zone_id"]       = zone["zone_id"]
             event["zone_name"]     = zone["zone_name"]

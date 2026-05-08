@@ -193,17 +193,19 @@ class TripMatcherCoProcess(KeyedCoProcessFunction):
     
     # =========== STREAM 1: GPS EVENTS ===========
     def process_element1(self, event, ctx):
-        """
-        Traite les events du premier stream connecté (GPS)
-        Met à jour l'état des véhicules disponibles
-        """
         if event["type"] != "gps":
             return []
         
-        if event["status"] != "available":
-            # Véhicule non disponible → le retirer de l'état
+        if event["status"] == "available":
+            # ← Toujours ajouter/mettre à jour les taxis disponibles
+            self.add_or_update_vehicle(event)
+            vehicles = self._get_vehicles()
+            print(f"✅ GPS available: Taxi {event['taxi_id']} zone {event['zone_id']} → {len(vehicles)} dispo")
+        else:
+            # Taxi en mouvement → retirer du pool
             self.remove_vehicle(event["taxi_id"])
-            return []
+        
+        return []
         
         # Véhicule disponible → l'ajouter ou mettre à jour
         self.add_or_update_vehicle(event)
