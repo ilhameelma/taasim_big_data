@@ -287,64 +287,38 @@ services:
         fs.s3a.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
     networks:
       - taasim-net
+      
   # ─────────────────────────────
-  #  5. APACHE SPARK
+  #  5. APACHE SPARK - AVEC SCRIPT SHELL
   # ─────────────────────────────
   spark-master:
     image: apache/spark:3.4.1
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     container_name: taasim-spark-master
     hostname: spark-master
     ports:
       - "8082:8080"
       - "7077:7077"
     volumes:
-      - ./spark-jars:/opt/spark/jars/extras        # ✔ correct
+      - ./spark-jars:/opt/spark/jars/extras
+      - ./spark/start-master.sh:/opt/spark/start-master.sh
     environment:
-      SPARK_MODE: master
-      SPARK_MASTER_HOST: spark-master
-
-      SPARK_DAEMON_JAVA_OPTS: >-
-        -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000
-        -Dspark.hadoop.fs.s3a.access.key=taasim
-        -Dspark.hadoop.fs.s3a.secret.key=taasim123
-        -Dspark.hadoop.fs.s3a.path.style.access=true
-        -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
-
-        # ✔ Spark doit charger les jars externes
-        -Dspark.driver.extraClassPath=/opt/spark/jars/extras/*
-        -Dspark.executor.extraClassPath=/opt/spark/jars/extras/*
-
-        # ✔ pour être sûr que Spark les utilise
-        -Dspark.jars=/opt/spark/jars/extras/*
+      SPARK_NO_DAEMONIZE: "true"
+    command: /bin/bash /opt/spark/start-master.sh
     networks:
       - taasim-net
 
   spark-worker:
     image: apache/spark:3.4.1
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     container_name: taasim-spark-worker
     depends_on:
       - spark-master
     volumes:
-      - ./spark-jars:/opt/spark/jars/extras        # ✔ correct
+      - ./spark-jars:/opt/spark/jars/extras
+      - ./spark/start-worker.sh:/opt/spark/start-worker.sh
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_MEMORY: 2G
       SPARK_WORKER_CORES: 2
-
-      SPARK_DAEMON_JAVA_OPTS: >-
-        -Dspark.hadoop.fs.s3a.endpoint=http://minio:9000
-        -Dspark.hadoop.fs.s3a.access.key=taasim
-        -Dspark.hadoop.fs.s3a.secret.key=taasim123
-        -Dspark.hadoop.fs.s3a.path.style.access=true
-        -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
-
-        # ✔ JARs pour worker
-        -Dspark.driver.extraClassPath=/opt/spark/jars/extras/*
-        -Dspark.executor.extraClassPath=/opt/spark/jars/extras/*
-        -Dspark.jars=/opt/spark/jars/extras/*
+    command: /bin/bash /opt/spark/start-worker.sh
     networks:
       - taasim-net
 
