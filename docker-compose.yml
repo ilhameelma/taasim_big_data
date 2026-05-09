@@ -287,12 +287,12 @@ services:
         fs.s3a.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
     networks:
       - taasim-net
-      
+
   # ─────────────────────────────
-  #  5. APACHE SPARK - AVEC SCRIPT SHELL
+  #  5. APACHE SPARK - AVEC DOCKERFILE
   # ─────────────────────────────
   spark-master:
-    image: apache/spark:3.4.1
+    build: ./spark
     container_name: taasim-spark-master
     hostname: spark-master
     ports:
@@ -301,24 +301,27 @@ services:
     volumes:
       - ./spark-jars:/opt/spark/jars/extras
       - ./spark/start-master.sh:/opt/spark/start-master.sh
+      - ./spark/start-worker.sh:/opt/spark/start-worker.sh
     environment:
       SPARK_NO_DAEMONIZE: "true"
-    command: /bin/bash /opt/spark/start-master.sh
+    command: ["/bin/bash", "/opt/spark/start-master.sh"]
     networks:
       - taasim-net
 
   spark-worker:
-    image: apache/spark:3.4.1
+    build: ./spark
     container_name: taasim-spark-worker
     depends_on:
       - spark-master
     volumes:
       - ./spark-jars:/opt/spark/jars/extras
+      - ./spark/start-master.sh:/opt/spark/start-master.sh
       - ./spark/start-worker.sh:/opt/spark/start-worker.sh
     environment:
       SPARK_WORKER_MEMORY: 2G
       SPARK_WORKER_CORES: 2
-    command: /bin/bash /opt/spark/start-worker.sh
+      SPARK_NO_DAEMONIZE: "true"
+    command: ["/bin/bash", "/opt/spark/start-worker.sh"]
     networks:
       - taasim-net
 

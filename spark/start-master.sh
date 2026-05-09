@@ -1,2 +1,2 @@
 #!/bin/bash
-/opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+org.apache.spark.deploy.master.Master
