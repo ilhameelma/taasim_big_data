@@ -291,6 +291,9 @@ services:
   # ─────────────────────────────
   #  5. APACHE SPARK - AVEC DOCKERFILE
   # ─────────────────────────────
+  # ─────────────────────────────
+#  5. APACHE SPARK - AVEC WORKERS SCALABLES
+# ─────────────────────────────
   spark-master:
     build: ./spark
     container_name: taasim-spark-master
@@ -301,22 +304,27 @@ services:
     volumes:
       - ./spark-jars:/opt/spark/jars/extras
       - ./spark/start-master.sh:/opt/spark/start-master.sh
-      - ./spark/start-worker.sh:/opt/spark/start-worker.sh
+      - ./requirements.txt:/tmp/requirements.txt
+      - ./spark/python-packages:/home/spark/.local
     environment:
       SPARK_NO_DAEMONIZE: "true"
     command: ["/bin/bash", "/opt/spark/start-master.sh"]
     networks:
       - taasim-net
+    user: root
 
-  spark-worker:
-    build: ./spark
-    container_name: taasim-spark-worker
+# Worker 1
+  spark-worker-1:
+    image: apache/spark:3.4.1
+    container_name: taasim-spark-worker-1
     depends_on:
       - spark-master
     volumes:
       - ./spark-jars:/opt/spark/jars/extras
       - ./spark/start-master.sh:/opt/spark/start-master.sh
       - ./spark/start-worker.sh:/opt/spark/start-worker.sh
+      - ./requirements.txt:/tmp/requirements.txt
+      - ./spark/python-packages:/home/spark/.local
     environment:
       SPARK_WORKER_MEMORY: 2G
       SPARK_WORKER_CORES: 2
@@ -324,7 +332,49 @@ services:
     command: ["/bin/bash", "/opt/spark/start-worker.sh"]
     networks:
       - taasim-net
+    user: root
 
+  # Worker 2 (ajoutez-en autant que nécessaire)
+  spark-worker-2:
+    image: apache/spark:3.4.1
+    container_name: taasim-spark-worker-2
+    profiles:
+      - disabled
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark-jars:/opt/spark/jars/extras
+      - ./spark/start-worker.sh:/opt/spark/start-worker.sh
+      - ./requirements.txt:/tmp/requirements.txt
+      - ./spark/python-packages:/home/spark/.local
+    environment:
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+    command: /bin/bash /opt/spark/start-worker.sh
+    networks:
+      - taasim-net
+    user: root
+
+  # Worker 3
+  spark-worker-3:
+    image: apache/spark:3.4.1
+    container_name: taasim-spark-worker-3
+    profiles:
+      - disabled
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark-jars:/opt/spark/jars/extras
+      - ./spark/start-worker.sh:/opt/spark/start-worker.sh
+      - ./requirements.txt:/tmp/requirements.txt
+      - ./spark/python-packages:/home/spark/.local
+    environment:
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+    command: /bin/bash /opt/spark/start-worker.sh
+    networks:
+      - taasim-net
+    user: root
   # ─────────────────────────────
   #  6. JUPYTER (Notebooks Semaine 1)
   # ─────────────────────────────

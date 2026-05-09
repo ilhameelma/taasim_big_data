@@ -432,6 +432,59 @@ class CassandraTripSink(MapFunction):
                 pass
 
 
+class MinIOArchiveSink(MapFunction):
+    """Archive les match events dans MinIO raw/kafka-archive/processed.matches/"""
+    
+    def open(self, ctx):
+        from minio import Minio
+        import io
+        self.client = Minio(
+            "minio:9000",
+            access_key="taasim",
+            secret_key="taasim123",
+            secure=False
+        )
+        self.bucket = "raw"
+        self.buffer = []
+        self.buffer_size = 100  # flush tous les 100 messages
+        self.batch_id = 0
+        print("✅ MINIO SINK READY → raw/kafka-archive/processed.matches/")
+    
+    def map(self, s):
+        try:
+            self.buffer.append(s)
+            if len(self.buffer) >= self.buffer_size:
+                self._flush()
+        except Exception as e:
+            print(f"MINIO ERR: {e}")
+        return s
+    
+    def _flush(self):
+        if not self.buffer:
+            return
+        import io
+        from datetime import datetime, timezone
+        
+        now = datetime.now(timezone.utc)
+        # Chemin : raw/kafka-archive/processed.matches/2025/05/09/batch_001.jsonl
+        path = f"kafka-archive/processed.matches/{now.strftime('%Y/%m/%d')}/batch_{self.batch_id:06d}.jsonl"
+        
+        content = "\n".join(self.buffer).encode("utf-8")
+        self.client.put_object(
+            self.bucket,
+            path,
+            io.BytesIO(content),
+            length=len(content),
+            content_type="application/jsonl"
+        )
+        print(f"💾 MINIO: {len(self.buffer)} matchs archivés → {path}")
+        self.buffer = []
+        self.batch_id += 1
+    
+    def close(self):
+        # Flush final à la fermeture
+        self._flush()
+
 # ============================================================
 # 4. MAIN
 # ============================================================
@@ -499,6 +552,7 @@ def main():
     # Sinks
     match_stream = match_stream.map(KafkaMatchSink(), output_type=Types.STRING())
     match_stream = match_stream.map(CassandraTripSink(), output_type=Types.STRING())
+    match_stream = match_stream.map(MinIOArchiveSink(), output_type=Types.STRING()) 
     match_stream.print()
     
     print("▶️  Démarrage du Job 3 (KeyedCoProcessFunction)...")

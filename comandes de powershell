@@ -31,3 +31,27 @@ pour Relancer le job(3 par example) modifié
 
 pour Lister les topics Kafka existants
     docker exec -it taasim-kafka /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+# 1. Créer le répertoire jobs dans le conteneur
+docker exec -it taasim-spark-master mkdir -p /opt/spark/jobs
+
+# 2. Copier le script
+docker cp spark-jobs/etl_porto.py taasim-spark-master:/opt/spark/jobs/etl_porto.py
+
+# 3. Vérifier que le fichier est bien présent
+docker exec -it taasim-spark-master ls -la /opt/spark/jobs/
+pour lancer le etl
+docker exec -it taasim-spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 --deploy-mode client --driver-memory 4g --executor-memory 2g --executor-cores 2 --conf spark.sql.shuffle.partitions=200 --jars /opt/spark/jars/extras/hadoop-aws-3.3.4.jar,/opt/spark/jars/extras/aws-java-sdk-bundle-1.12.262.jar /opt/spark/jobs/etl_porto.py --max-rows 1000 --geojson-path /opt/spark/data/data/Arrondissements.geojson --graph-path /opt/spark/data/data/casa_graph.graphml
+ cree table kpi kpi_metrics
+ USE taasim;
+
+CREATE TABLE IF NOT EXISTS kpi_metrics (
+    city          text,
+    zone_id       int,
+    year_week     text,
+    zone_name     text,
+    trips_count   bigint,
+    avg_duration_sec double,
+    peak_hour     int,
+    coverage_gap  boolean,
+    PRIMARY KEY ((city, zone_id), year_week)
+) WITH CLUSTERING ORDER BY (year_week DESC);

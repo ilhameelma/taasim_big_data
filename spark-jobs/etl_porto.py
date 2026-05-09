@@ -1,21 +1,21 @@
+#!/usr/bin/env python3
 """
 TaaSim — Spark ETL Porto
 ========================
 ENSA Al Hoceima — Capstone 2025-2026
 
-Pipeline (identique au notebook 02_zone_remapping) :
+Pipeline complet 100% Spark avec optimisation par grille :
   1. Lecture Porto CSV depuis MinIO raw/
-  2. Remapping linéaire Porto → bbox Casablanca  (remap_udf)
-  3. Translation pondérée population → zone Casa  (translate_udf)
-  4. Road snapping OSMnx via plus court chemin    (snap_polyline_local)
+  2. Remapping linéaire Porto → bbox Casablanca
+  3. Translation pondérée population → zone Casa
+  4. Road snapping OSMnx via UDF Spark (recherche par grille optimisée)
   5. Calcul origin_zone / dest_zone
   6. Déduplication
   7. Écriture Parquet partitionné → curated/porto-trips/
 """
 
-import argparse, json, time, logging, os
-import pandas as pd
-import numpy as np
+import argparse, json, time, logging, os, math
+import heapq
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -32,9 +32,6 @@ logging.basicConfig(
 log = logging.getLogger("etl_porto")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Paramètres
-# ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--minio-endpoint",     default="minio:9000")
@@ -44,40 +41,50 @@ def parse_args():
     p.add_argument("--raw-prefix",         default="porto-trips/train.csv")
     p.add_argument("--curated-bucket",     default="curated")
     p.add_argument("--curated-prefix",     default="trips")
-    p.add_argument("--geojson-path",       default="/home/jovyan/work/data/Arrondissements.geojson")
-    p.add_argument("--graph-path",         default="/home/jovyan/work/data/casa_graph.graphml")
-    p.add_argument("--snap-sample-size",   type=int, default=5000,
-                   help="Nb de trajets à soumettre au road snapping (le reste garde translate)")
+    p.add_argument("--geojson-path",       default="/opt/spark/data/data/Arrondissements.geojson")
+    p.add_argument("--graph-path",         default="/opt/spark/data/data/casa_graph.graphml")
     p.add_argument("--max-rows",           type=int, default=None)
     p.add_argument("--shuffle-partitions", type=int, default=200)
+    p.add_argument("--grid-size",          type=int, default=100, help="Taille de la grille pour recherche spatiale")
     return p.parse_args()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SparkSession
-# ─────────────────────────────────────────────────────────────────────────────
 def build_spark(args):
     spark = (
         SparkSession.builder
         .appName("TaaSim-ETL-Porto")
+        .config("spark.master", "spark://spark-master:7077")
         .config("spark.driver.memory", "4g")
-        .config("spark.executor.memory", "4g")
+        .config("spark.executor.memory", "2g")
+        .config("spark.executor.cores", "2")
+        .config("spark.executor.instances", "4")
+        .config("spark.dynamicAllocation.enabled", "false")
         .config("spark.sql.shuffle.partitions", str(args.shuffle_partitions))
-        .config("spark.hadoop.fs.s3a.endpoint",          f"http://{args.minio_endpoint}")
-        .config("spark.hadoop.fs.s3a.access.key",        args.minio_access_key)
-        .config("spark.hadoop.fs.s3a.secret.key",        args.minio_secret_key)
+        .config("spark.default.parallelism", "200")
+        .config("spark.broadcast.compress", "true")
+        .config("spark.sql.autoBroadcastJoinThreshold", "50MB")
+        .config("spark.sql.broadcastTimeout", "1200")
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+        .config("spark.sql.execution.arrow.maxRecordsPerBatch", "10000")
+        .config("spark.hadoop.fs.s3a.endpoint", f"http://{args.minio_endpoint}")
+        .config("spark.hadoop.fs.s3a.access.key", args.minio_access_key)
+        .config("spark.hadoop.fs.s3a.secret.key", args.minio_secret_key)
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.impl",              "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+        .config("spark.hadoop.fs.s3a.aws.credentials.provider", 
+                "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
         .getOrCreate()
     )
+    
     spark.sparkContext.setLogLevel("WARN")
+    spark.sparkContext.setCheckpointDir("/tmp/spark-checkpoints")
+    
+    log.info(f"  ✓ Spark connecté au master: {spark.sparkContext.master}")
+    log.info(f"  ✓ {spark.sparkContext.defaultParallelism} tasks parallèles")
     return spark
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Chargement GeoJSON + construction zones_info (identique notebook cellule 6/8)
-# ─────────────────────────────────────────────────────────────────────────────
 def load_zones(geojson_path):
     import geopandas as gpd
     gdf = gpd.read_file(geojson_path).to_crs("EPSG:4326")
@@ -98,8 +105,8 @@ def load_zones(geojson_path):
 
     zones_info = []
     for idx, row in gdf.iterrows():
-        name = row[name_col]
-        geom = row.geometry
+        name  = row[name_col]
+        geom  = row.geometry
         bounds = geom.bounds
         zones_info.append({
             "zone_id":      int(idx),
@@ -121,43 +128,172 @@ def load_zones(geojson_path):
     return zones_info, bounds_dict
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Chargement graphe OSMnx (identique notebook cellule 16)
-# ─────────────────────────────────────────────────────────────────────────────
-def load_graph(graph_path):
+def build_grid_index(nodes_list, grid_size=100):
+    """
+    Construit un index spatial par grille pour recherche rapide des nœuds.
+    
+    Args:
+        nodes_list: Liste de tuples (node_id, lon, lat)
+        grid_size: Nombre de cellules par dimension (grid_size x grid_size)
+    
+    Returns:
+        Dictionnaire contenant la grille et les métadonnées pour la recherche
+    """
+    if not nodes_list:
+        return {"grid": {}, "nodes_list": [], "grid_size": grid_size}
+    
+    # Calculer les bornes
+    lons = [n[1] for n in nodes_list]
+    lats = [n[2] for n in nodes_list]
+    lon_min, lon_max = min(lons), max(lons)
+    lat_min, lat_max = min(lats), max(lats)
+    
+    # Éviter la division par zéro
+    lon_step = (lon_max - lon_min) / grid_size if grid_size > 0 and lon_max > lon_min else 0.001
+    lat_step = (lat_max - lat_min) / grid_size if grid_size > 0 and lat_max > lat_min else 0.001
+    
+    # Construire la grille
+    grid = {}
+    for nid, lon, lat in nodes_list:
+        gx = int((lon - lon_min) / lon_step) if lon_step > 0 else 0
+        gy = int((lat - lat_min) / lat_step) if lat_step > 0 else 0
+        gx = max(0, min(grid_size - 1, gx))
+        gy = max(0, min(grid_size - 1, gy))
+        key = (gx, gy)
+        if key not in grid:
+            grid[key] = []
+        grid[key].append((nid, lon, lat))
+    
+    log.info(f"  ✓ Grille construite: {len(grid)} cellules occupées sur {grid_size}x{grid_size}")
+    
+    return {
+        "grid": grid,
+        "lon_min": lon_min,
+        "lon_max": lon_max,
+        "lat_min": lat_min,
+        "lat_max": lat_max,
+        "lon_step": lon_step,
+        "lat_step": lat_step,
+        "grid_size": grid_size,
+        "nodes_list": nodes_list  # fallback
+    }
+
+
+def nearest_node_grid(lon, lat, grid_data):
+    """
+    Trouve le nœud le plus proche en utilisant l'index par grille.
+    Ne regarde que la cellule cible et ses 8 voisines.
+    """
+    # 1. Trouver la cellule cible
+    gx = int((lon - grid_data["lon_min"]) / grid_data["lon_step"])
+    gy = int((lat - grid_data["lat_min"]) / grid_data["lat_step"])
+    gx = max(0, min(grid_data["grid_size"] - 1, gx))
+    gy = max(0, min(grid_data["grid_size"] - 1, gy))
+    
+    # 2. Collecter les candidats des cellules voisines (9 cellules)
+    candidates = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            nx, ny = gx + dx, gy + dy
+            if 0 <= nx < grid_data["grid_size"] and 0 <= ny < grid_data["grid_size"]:
+                key = (nx, ny)
+                if key in grid_data["grid"]:
+                    candidates.extend(grid_data["grid"][key])
+    
+    # 3. Fallback: tous les nœuds si aucune cellule trouvée
+    if not candidates:
+        candidates = grid_data["nodes_list"]
+    
+    # 4. Recherche linéaire sur les candidats seulement
+    best_id = None
+    best_dist = float("inf")
+    for nid, nlon, nlat in candidates:
+        d = (nlon - lon) ** 2 + (nlat - lat) ** 2
+        if d < best_dist:
+            best_dist = d
+            best_id = nid
+    
+    return best_id
+
+
+def load_graph_as_dict(graph_path, grid_size=100):
+    """
+    Charge le graphe OSMnx et le convertit en dictionnaires Python
+    broadcastables dans Spark :
+      - nodes_dict : {node_id: (lon, lat)}
+      - adj_dict   : {node_id: {neighbor_id: length}}
+      - nodes_list : list de (node_id, lon, lat)
+      - grid_data  : index spatial pour recherche rapide
+    """
     import osmnx as ox
+
+    log.info(f"  Chargement graphe depuis {graph_path}...")
     if os.path.exists(graph_path):
-        log.info(f"  Chargement graphe depuis {graph_path}...")
         G = ox.load_graphml(graph_path)
     else:
-        log.info("  Téléchargement graphe OSM Casablanca (première fois)...")
+        log.info("  Téléchargement graphe OSM Casablanca...")
         G = ox.graph_from_place("Casablanca, Morocco", network_type="drive")
         ox.save_graphml(G, graph_path)
-        log.info(f"  ✓ Graphe sauvegardé → {graph_path}")
-    log.info(f"  ✓ Graphe prêt — {len(G.nodes)} nœuds, {len(G.edges)} arêtes")
-    return G
+
+    log.info(f"  ✓ Graphe chargé — {len(G.nodes)} nœuds, {len(G.edges)} arêtes")
+    log.info("  Conversion en dictionnaires Python pour broadcast...")
+
+    # Dictionnaire des noeuds : id → (lon, lat)
+    nodes_dict = {}
+    nodes_list = []
+    for n in G.nodes:
+        lon = float(G.nodes[n].get("x", 0))
+        lat = float(G.nodes[n].get("y", 0))
+        nodes_dict[int(n)] = (lon, lat)
+        nodes_list.append((int(n), lon, lat))
+
+    # Dictionnaire d'adjacence : id → {neighbor: length}
+    adj_dict = {}
+    for u, v, data in G.edges(data=True):
+        u, v = int(u), int(v)
+        length = float(data.get("length", 1.0))
+        
+        if u not in adj_dict:
+            adj_dict[u] = {}
+        if v not in adj_dict[u] or adj_dict[u][v] > length:
+            adj_dict[u][v] = length
+        
+        # Graphe non-dirigé → les deux sens
+        if v not in adj_dict:
+            adj_dict[v] = {}
+        if u not in adj_dict[v] or adj_dict[v][u] > length:
+            adj_dict[v][u] = length
+
+    log.info(f"  ✓ Dictionnaires prêts ({len(nodes_dict)} nœuds)")
+
+    # Construire l'index spatial par grille
+    log.info(f"  Construction de l'index spatial (grille {grid_size}x{grid_size})...")
+    grid_data = build_grid_index(nodes_list, grid_size)
+    
+    return nodes_dict, adj_dict, nodes_list, grid_data
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UDFs Spark (identique notebook cellules 12/14)
-# ─────────────────────────────────────────────────────────────────────────────
-def build_spark_udfs(zones_info, bounds_dict, spark):
+def build_udfs(zones_info, bounds_dict, nodes_dict, adj_dict, nodes_list, grid_data, spark):
     import random
 
-    # Bounds sérialisés pour les UDFs
+    # Bornes Porto (fixes, issues du dataset Porto)
     PORTO_LON_MIN, PORTO_LON_MAX = -8.73, -8.55
     PORTO_LAT_MIN, PORTO_LAT_MAX = 41.10, 41.22
+
     cb_s = json.dumps([bounds_dict["casa_lon_min"], bounds_dict["casa_lat_min"],
                        bounds_dict["casa_lon_max"], bounds_dict["casa_lat_max"]])
     pb_s = json.dumps([PORTO_LON_MIN, PORTO_LAT_MIN, PORTO_LON_MAX, PORTO_LAT_MAX])
 
-    # Broadcast zones
-    zones_bc   = spark.sparkContext.broadcast(json.dumps(zones_info))
-    total_pop  = sum(z["population"] for z in zones_info)
-    weights    = [z["population"] / total_pop for z in zones_info]
-    weights_bc = spark.sparkContext.broadcast(json.dumps(weights))
+    # Broadcast toutes les données
+    zones_bc    = spark.sparkContext.broadcast(json.dumps(zones_info))
+    total_pop   = sum(z["population"] for z in zones_info)
+    weights     = [z["population"] / total_pop for z in zones_info]
+    weights_bc  = spark.sparkContext.broadcast(json.dumps(weights))
+    nodes_bc    = spark.sparkContext.broadcast(nodes_dict)
+    adj_bc      = spark.sparkContext.broadcast(adj_dict)
+    grid_bc     = spark.sparkContext.broadcast(grid_data)  # ← Index spatial broadcasté
 
-    # ── remap_udf : remapping linéaire Porto → Casa (+ projection dans polygone)
+    # ── remap_udf
     def remap_polyline(polyline_str):
         try:
             pts = json.loads(polyline_str)
@@ -169,7 +305,6 @@ def build_spark_udfs(zones_info, bounds_dict, spark):
             for lon, lat in pts:
                 new_lon = cb[0] + (lon - pb[0]) / (pb[2] - pb[0]) * (cb[2] - cb[0])
                 new_lat = cb[1] + (lat - pb[1]) / (pb[3] - pb[1]) * (cb[3] - cb[1])
-                # Clamp dans la bbox Casablanca
                 new_lon = max(cb[0], min(cb[2], new_lon))
                 new_lat = max(cb[1], min(cb[3], new_lat))
                 out.append([round(new_lon, 6), round(new_lat, 6)])
@@ -179,7 +314,7 @@ def build_spark_udfs(zones_info, bounds_dict, spark):
 
     remap_udf = F.udf(remap_polyline, StringType())
 
-    # ── translate_udf : translation pondérée population (identique notebook cellule 14)
+    # ── translate_udf
     translate_schema = StructType([
         StructField("polyline",  StringType(),  True),
         StructField("zone_id",   IntegerType(), True),
@@ -206,7 +341,89 @@ def build_spark_udfs(zones_info, bounds_dict, spark):
 
     translate_udf = F.udf(translate_fn, translate_schema)
 
-    # ── zone_from_point_udf : lookup bbox (identique notebook cellule 20)
+    # ── snap_udf : road snapping OPTIMISÉ avec recherche par grille
+    def snap_fn(polyline_str):
+        """
+        Snape une polyline sur le réseau routier OSM.
+        Utilise l'index par grille pour trouver les nœuds rapidement.
+        """
+        try:
+            pts = json.loads(polyline_str)
+            if not pts or len(pts) < 2:
+                return None
+
+            nodes = nodes_bc.value
+            adj = adj_bc.value
+            grid_data_local = grid_bc.value
+
+            # Fonction nearest_node avec recherche par grille (optimisée)
+            def nearest_node(lon, lat):
+                return nearest_node_grid(lon, lat, grid_data_local)
+
+            # 1. Premier et dernier point de la polyline
+            lon1, lat1 = pts[0]
+            lon2, lat2 = pts[-1]
+
+            # 2. Snap aux nœuds OSM les plus proches (optimisé!)
+            start_node = nearest_node(lon1, lat1)
+            end_node = nearest_node(lon2, lat2)
+
+            if start_node == end_node or start_node is None or end_node is None:
+                return None
+
+            # 3. Dijkstra pour trouver le chemin le plus court
+            dist = {start_node: 0.0}
+            prev = {}
+            heap = [(0.0, start_node)]
+            visited = set()
+
+            while heap:
+                d, u = heapq.heappop(heap)
+                if u in visited:
+                    continue
+                visited.add(u)
+                if u == end_node:
+                    break
+                for v, length in adj.get(u, {}).items():
+                    nd = d + length
+                    if nd < dist.get(v, float("inf")):
+                        dist[v] = nd
+                        prev[v] = u
+                        heapq.heappush(heap, (nd, v))
+
+            # 4. Reconstruire le chemin
+            if end_node not in prev and end_node != start_node:
+                return None
+
+            path = []
+            cur = end_node
+            while cur != start_node:
+                path.append(cur)
+                if cur not in prev:
+                    return None
+                cur = prev[cur]
+            path.append(start_node)
+            path.reverse()
+
+            # 5. Convertir en coordonnées [[lon, lat], ...]
+            route = []
+            for nid in path:
+                if nid in nodes:
+                    route.append([nodes[nid][0], nodes[nid][1]])
+                else:
+                    return None
+
+            if len(route) < 2:
+                return None
+
+            return json.dumps(route)
+
+        except Exception:
+            return None
+
+    snap_udf = F.udf(snap_fn, StringType())
+
+    # ── zone_udf
     zone_schema = StructType([
         StructField("zone_id",   IntegerType(), True),
         StructField("zone_name", StringType(),  True),
@@ -225,128 +442,75 @@ def build_spark_udfs(zones_info, bounds_dict, spark):
 
     zone_udf = F.udf(zone_from_point, zone_schema)
 
-    # Helpers first/last point (format [[lon,lat],...])
+    # Helpers
     @F.udf(DoubleType())
     def first_lat_udf(s):
-        try: return float(json.loads(s)[0][1])
-        except: return None
+        try: 
+            pts = json.loads(s)
+            return float(pts[0][1]) if pts else None
+        except: 
+            return None
 
     @F.udf(DoubleType())
     def first_lon_udf(s):
-        try: return float(json.loads(s)[0][0])
-        except: return None
+        try: 
+            pts = json.loads(s)
+            return float(pts[0][0]) if pts else None
+        except: 
+            return None
 
     @F.udf(DoubleType())
     def last_lat_udf(s):
-        try: return float(json.loads(s)[-1][1])
-        except: return None
+        try: 
+            pts = json.loads(s)
+            return float(pts[-1][1]) if pts else None
+        except: 
+            return None
 
     @F.udf(DoubleType())
     def last_lon_udf(s):
-        try: return float(json.loads(s)[-1][0])
-        except: return None
+        try: 
+            pts = json.loads(s)
+            return float(pts[-1][0]) if pts else None
+        except: 
+            return None
 
     @F.udf(IntegerType())
     def duration_udf(s):
-        try: return len(json.loads(s)) * 15
-        except: return None
-
-    return remap_udf, translate_udf, zone_udf, first_lat_udf, first_lon_udf, last_lat_udf, last_lon_udf, duration_udf
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Road snapping en Pandas (identique notebook cellule 23)
-# Appliqué sur un échantillon configurable, le reste garde la polyline traduite
-# ─────────────────────────────────────────────────────────────────────────────
-def snap_polyline_local(polyline_str, G):
-    """Identique à snap_polyline_local du notebook cellule 23."""
-    import networkx as nx
-    import osmnx as ox
-    try:
-        pts = json.loads(polyline_str)
-        if len(pts) < 2:
+        try: 
+            return len(json.loads(s)) * 15
+        except: 
             return None
-        lon1, lat1 = pts[0]
-        lon2, lat2 = pts[-1]
-        node1 = ox.nearest_nodes(G, lon1, lat1)
-        node2 = ox.nearest_nodes(G, lon2, lat2)
-        if node1 == node2:
-            return None
-        path = nx.shortest_path(G, node1, node2, weight="length")
-        full_route = [[G.nodes[n]["x"], G.nodes[n]["y"]] for n in path]
-        if len(full_route) < 2:
-            return None
-        return json.dumps(full_route)
-    except Exception:
-        return None
+
+    return (remap_udf, translate_udf, snap_udf, zone_udf,
+            first_lat_udf, first_lon_udf, last_lat_udf, last_lon_udf, duration_udf)
 
 
-def apply_road_snap(df_spark, G, snap_sample_size, spark):
-    """
-    1. Prend un échantillon de snap_sample_size trajets
-    2. Applique snap_polyline_local en Pandas (comme le notebook)
-    3. Remonte en Spark et rejoint avec le reste du dataset
-    """
-    log.info(f"  Road snapping sur {snap_sample_size} trajets (Pandas)...")
-
-    # Échantillon à snapper
-    pdf_sample = df_spark.limit(snap_sample_size).toPandas()
-    log.info(f"  Collecté {len(pdf_sample)} trajets pour snapping...")
-
-    pdf_sample["snapped_polyline"] = pdf_sample["translated_polyline"].apply(
-        lambda x: snap_polyline_local(x, G)
-    )
-    # Fallback : si snap échoue → garder la polyline traduite
-    pdf_sample["snapped_polyline"] = pdf_sample.apply(
-        lambda r: r["snapped_polyline"] if r["snapped_polyline"] else r["translated_polyline"],
-        axis=1
-    )
-    n_snapped = pdf_sample["snapped_polyline"].notna().sum()
-    log.info(f"  ✓ {n_snapped}/{len(pdf_sample)} trajets snappés sur routes OSM")
-
-    # Remonter l'échantillon en Spark
-    df_snapped = spark.createDataFrame(pdf_sample)
-
-    # Le reste du dataset (non snappé) : utilise la polyline traduite directement
-    snapped_ids = [str(r) for r in pdf_sample["TRIP_ID"].tolist()]
-    df_rest = df_spark.filter(~F.col("TRIP_ID").isin(snapped_ids)) \
-                      .withColumn("snapped_polyline", F.col("translated_polyline"))
-
-    # Union des deux
-    common_cols = [c for c in df_snapped.columns if c in df_rest.columns]
-    df_final = df_snapped.select(common_cols).union(df_rest.select(common_cols))
-    return df_final
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline principal
-# ─────────────────────────────────────────────────────────────────────────────
 def main():
     args  = parse_args()
     t0    = time.time()
 
-    log.info("🚕 TaaSim — Spark ETL Porto démarré")
-    log.info(f"   Source   : s3a://{args.raw_bucket}/{args.raw_prefix}")
-    log.info(f"   Output   : s3a://{args.curated_bucket}/{args.curated_prefix}")
-    log.info(f"   Snapping : {args.snap_sample_size} trajets")
+    log.info("🚕 TaaSim — Spark ETL Porto (snapping optimisé par grille)")
+    log.info(f"   Source  : s3a://{args.raw_bucket}/{args.raw_prefix}")
+    log.info(f"   Output  : s3a://{args.curated_bucket}/{args.curated_prefix}")
+    log.info(f"   Grid size : {args.grid_size}x{args.grid_size}")
     log.info("")
 
     spark = build_spark(args)
 
-    # ── Chargement ressources
+    # Chargement ressources
     log.info("Chargement GeoJSON + graphe OSM...")
-    zones_info, bounds_dict = load_zones(args.geojson_path)
-    G = load_graph(args.graph_path)
+    zones_info, bounds_dict           = load_zones(args.geojson_path)
+    nodes_dict, adj_dict, nodes_list, grid_data = load_graph_as_dict(args.graph_path, args.grid_size)
 
-    # ── UDFs
-    (remap_udf, translate_udf, zone_udf,
+    # UDFs
+    (remap_udf, translate_udf, snap_udf, zone_udf,
      first_lat_udf, first_lon_udf, last_lat_udf, last_lon_udf,
-     duration_udf) = build_spark_udfs(zones_info, bounds_dict, spark)
+     duration_udf) = build_udfs(zones_info, bounds_dict, nodes_dict, adj_dict, nodes_list, grid_data, spark)
 
-    # ── ÉTAPE 1 : Lecture CSV Porto
+    # ── ÉTAPE 1 : Lecture
     log.info("ÉTAPE 1 — Lecture Porto CSV depuis MinIO...")
-    path = f"s3a://{args.raw_bucket}/{args.raw_prefix}"
-    df = spark.read.csv(path, header=True)
+    df = spark.read.csv(f"s3a://{args.raw_bucket}/{args.raw_prefix}", header=True)
     df = (df.filter(F.col("MISSING_DATA") == "False")
             .filter(F.col("POLYLINE").isNotNull())
             .filter(F.col("POLYLINE") != "[]"))
@@ -355,7 +519,7 @@ def main():
     c_raw = df.count()
     log.info(f"  ✓ {c_raw:,} trajets valides chargés")
 
-    # ── ÉTAPE 2 : Remapping linéaire Porto → Casa
+    # ── ÉTAPE 2 : Remapping linéaire
     log.info("ÉTAPE 2 — Remapping linéaire Porto → Casablanca...")
     df = (df.withColumn("remapped_linear", remap_udf(F.col("POLYLINE")))
             .filter(F.col("remapped_linear").isNotNull()))
@@ -369,11 +533,17 @@ def main():
     c_remapped = df.count()
     log.info(f"  ✓ {c_remapped:,} trajets après remapping + translation")
 
-    # ── ÉTAPE 4 : Road snapping OSMnx (Pandas, échantillon)
-    log.info("ÉTAPE 4 — Road snapping OSMnx...")
-    df = apply_road_snap(df, G, args.snap_sample_size, spark)
+    # ── ÉTAPE 4 : Road snapping via UDF Spark (OPTIMISÉ)
+    log.info("ÉTAPE 4 — Road snapping OSM (recherche par grille, UDF Spark)...")
+    df = df.withColumn("snapped_polyline", snap_udf(F.col("translated_polyline"))) \
+           .drop("translated_polyline")
+    
+    # Filtrer les trajets qui n'ont pas pu être snappés
+    df = df.filter(F.col("snapped_polyline").isNotNull())
+    c_snapped = df.count()
+    log.info(f"  ✓ {c_snapped:,} trajets après snapping (taux: {c_snapped/c_remapped*100:.1f}%)")
 
-    # ── ÉTAPE 5 : Calcul origin_zone / dest_zone (identique notebook cellule 24)
+    # ── ÉTAPE 5 : origin_zone / dest_zone
     log.info("ÉTAPE 5 — Calcul origin_zone / dest_zone...")
     df = (df
         .withColumn("_o_lat", first_lat_udf(F.col("snapped_polyline")))
@@ -388,22 +558,21 @@ def main():
         .withColumn("dest_zone_name",   F.col("_dz.zone_name"))
         .drop("_o_lat", "_o_lon", "_d_lat", "_d_lon", "_oz", "_dz"))
 
-    # ── ÉTAPE 6 : Métadonnées + déduplication (identique notebook cellule 24)
+    # ── ÉTAPE 6 : Métadonnées + déduplication
     log.info("ÉTAPE 6 — Métadonnées + déduplication...")
     df = (df
-        .withColumn("trip_id",          F.col("TRIP_ID").cast(StringType()))
-        .withColumn("taxi_id",          F.col("TAXI_ID").cast(IntegerType()))
-        .withColumn("timestamp",        F.col("TIMESTAMP").cast(LongType()))
+        .withColumn("trip_id",           F.col("TRIP_ID").cast(StringType()))
+        .withColumn("taxi_id",           F.col("TAXI_ID").cast(IntegerType()))
+        .withColumn("timestamp",         F.col("TIMESTAMP").cast(LongType()))
         .withColumn("trip_duration_sec", duration_udf(F.col("snapped_polyline")))
         .withColumn("year_month",
                     F.date_format(F.from_unixtime(F.col("TIMESTAMP").cast("long")), "yyyy-MM")))
-
-    before_dedup = df.count()
+    before = df.count()
     df = df.dropDuplicates(["trip_id"])
     c_deduped = df.count()
-    log.info(f"  ✓ {before_dedup - c_deduped} doublons supprimés → {c_deduped:,} trajets uniques")
+    log.info(f"  ✓ {before - c_deduped} doublons supprimés → {c_deduped:,} trajets uniques")
 
-    # ── ÉTAPE 7 : Sélection colonnes finales + écriture Parquet
+    # ── ÉTAPE 7 : Écriture Parquet
     log.info("ÉTAPE 7 — Écriture Parquet partitionné dans MinIO...")
     FINAL_COLS = [
         "trip_id", "taxi_id", "timestamp",
@@ -420,7 +589,7 @@ def main():
              .parquet(out))
     log.info(f"  ✓ Parquet écrit → {out}")
 
-    # ── Rapport de validation
+    # Rapport
     elapsed = time.time() - t0
     log.info("")
     log.info("=" * 55)
@@ -428,18 +597,27 @@ def main():
     log.info("=" * 55)
     log.info(f"  Lignes brutes           : {c_raw:>10,}")
     log.info(f"  Après remapping         : {c_remapped:>10,}")
+    log.info(f"  Après snapping          : {c_snapped:>10,}")
     log.info(f"  Après déduplication     : {c_deduped:>10,}")
     log.info(f"  Temps total             : {elapsed:>10.1f} s")
-    log.info(f"  Critère < 5 min         : {'✅ PASS' if elapsed < 300 else '⚠️  (snapping inclus)'}")
+    log.info(f"  Critère < 5 min         : {'✅ PASS' if elapsed < 300 else '⚠️  dépasse 5min'}")
+    
+    # Afficher statistiques de la grille
+    log.info("")
+    log.info("  Statistiques de l'index spatial:")
+    log.info(f"    Grille: {args.grid_size}x{args.grid_size}")
+    log.info(f"    Cellules occupées: {len(grid_data['grid'])}")
+    log.info(f"    Nœuds par cellule (moyenne): {len(nodes_list) / max(1, len(grid_data['grid'])):.1f}")
+    
     try:
         top = (df_final.groupBy("origin_zone_name").count()
                .orderBy(F.col("count").desc()).limit(5).toPandas())
         log.info("")
         log.info("  Top 5 zones origin :")
         for _, r in top.iterrows():
-            log.info(f"    {str(r['origin_zone_name']):<28} {int(r['count']):>6,} trajets")
-    except Exception:
-        pass
+            log.info(f"    {str(r['origin_zone_name'])[:30]:<32} {int(r['count']):>6,} trajets")
+    except Exception as e:
+        log.warning(f"  Impossible d'afficher le top zones: {e}")
     log.info("=" * 55)
 
     spark.stop()
