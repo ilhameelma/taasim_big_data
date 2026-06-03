@@ -1,6 +1,4 @@
-# flink_job1_gps_normalizer.py
-# Semaine 3 — Tâche 5 : Sink Cassandra via MapFunction
-# Semaine 4 — Ajout : publication sur Kafka processed.gps
+# flink_job1_gps_normalizer.py — VERSION CORRIGÉE
 
 import json
 import csv
@@ -25,9 +23,6 @@ def is_in_casablanca_bbox(lon, lat):
     return (CASA_LON_MIN <= lon <= CASA_LON_MAX and
             CASA_LAT_MIN <= lat <= CASA_LAT_MAX)
 
-# ============================================================
-# 1. Parse JSON
-# ============================================================
 class ParseGpsEvent(MapFunction):
     def map(self, raw_str):
         try:
@@ -38,9 +33,6 @@ class ParseGpsEvent(MapFunction):
         except Exception:
             return None
 
-# ============================================================
-# 2. Filtre bbox
-# ============================================================
 class ValidEvent(FilterFunction):
     def filter(self, event):
         if event is None:
@@ -48,17 +40,10 @@ class ValidEvent(FilterFunction):
         required = ["taxi_id", "timestamp_unix", "status"]
         if not all(k in event for k in required):
             return False
-        
-        # Si lat/lon présents, vérifier la bbox
         if "lat" in event and "lon" in event:
             return is_in_casablanca_bbox(event.get("lon"), event.get("lat"))
-        
-        # Event sans lat/lon (fin de trajet) → laisser passer si available
         return event.get("status") == "available"
 
-# ============================================================
-# 3. Zone mapping + Anonymisation
-# ============================================================
 class ZoneMappingFunction(MapFunction):
     def __init__(self):
         self.zones = None
@@ -73,18 +58,15 @@ class ZoneMappingFunction(MapFunction):
                     with open(path, 'r') as f:
                         reader = csv.DictReader(f)
                         for row in reader:
-                            lon_min = float(row["bbox_lon_min"])
-                            lon_max = float(row["bbox_lon_max"])
-                            lat_min = float(row["bbox_lat_min"])
-                            lat_max = float(row["bbox_lat_max"])
                             zones.append({
                                 "zone_id": int(row["zone_id"]),
                                 "zone_name": row.get("prefecture", row.get("zone_name", "Unknown")),
                                 "zone_type": row.get("zone_type", "mixed"),
                                 "base_fare_mad": float(row.get("base_fare_mad", 8.0)),
-                                "bbox": (lon_min, lon_max, lat_min, lat_max),
-                                "centroid_lon": (lon_min + lon_max) / 2,
-                                "centroid_lat": (lat_min + lat_max) / 2,
+                                "bbox": (float(row["bbox_lon_min"]), float(row["bbox_lon_max"]),
+                                         float(row["bbox_lat_min"]), float(row["bbox_lat_max"])),
+                                "centroid_lon": (float(row["bbox_lon_min"]) + float(row["bbox_lon_max"])) / 2,
+                                "centroid_lat": (float(row["bbox_lat_min"]) + float(row["bbox_lat_max"])) / 2,
                             })
                     if zones:
                         self.zones = zones
@@ -121,8 +103,7 @@ class ZoneMappingFunction(MapFunction):
     def map(self, event):
         lon = event.get("lon")
         lat = event.get("lat")
-        
-        # Si pas de coordonnées, utiliser le centroïde de Casablanca par défaut
+
         if lon is None or lat is None:
             event["zone_id"]       = event.get("zone_id", 1)
             event["zone_name"]     = event.get("zone_name", "Unknown")
@@ -131,13 +112,16 @@ class ZoneMappingFunction(MapFunction):
             event["lat"]           = 33.5731
             event["lon"]           = -7.5898
             return event
+
+        zone = self.get_zone(lon, lat)  # ✅ BUG 1 CORRIGÉ
+
         if zone:
             event["zone_id"]       = zone["zone_id"]
             event["zone_name"]     = zone["zone_name"]
             event["zone_type"]     = zone["zone_type"]
             event["base_fare_mad"] = zone["base_fare_mad"]
-            event["lat"]           = zone["centroid_lat"]   # 🔒 anonymisé
-            event["lon"]           = zone["centroid_lon"]   # 🔒 anonymisé
+            event["lat"]           = zone["centroid_lat"]
+            event["lon"]           = zone["centroid_lon"]
         else:
             event["zone_id"]       = 0
             event["zone_name"]     = "Inconnu"
@@ -147,9 +131,6 @@ class ZoneMappingFunction(MapFunction):
             event["lon"]           = -7.5898
         return event
 
-# ============================================================
-# 4. Sink Cassandra → vehicle_positions
-# ============================================================
 class CassandraSinkMap(MapFunction):
     def __init__(self):
         self.session     = None
@@ -157,7 +138,8 @@ class CassandraSinkMap(MapFunction):
 
     def open(self, runtime_context):
         from cassandra.cluster import Cluster
-        cluster = Cluster([CASSANDRA_HOST], port=CASSANDRA_PORT)
+        cluster = Cluster([CASSANDRA_HOST], port=CASSANDRA_PORT,
+                          protocol_version=5)  # ✅ supprime les WARN de protocol
         self.session = cluster.connect(KEYSPACE)
         self.insert_stmt = self.session.prepare("""
             INSERT INTO vehicle_positions
@@ -180,26 +162,17 @@ class CassandraSinkMap(MapFunction):
                 str(event.get("status", "unknown")),
                 float(event.get("trip_progress", 0.0))
             ))
-            return event   # passe l'event au sink Kafka suivant
+            return event
         except Exception as e:
             print(f"❌ [Job1] Cassandra error taxi {event.get('taxi_id')}: {e}")
-            return event   # on continue quand même vers Kafka
+            return event
 
     def close(self):
         if self.session:
             self.session.shutdown()
 
-# ============================================================
-# 5. ✨ NOUVEAU — Sink Kafka → processed.gps
-#    Sérialise l'event enrichi (avec zone_id, zone_name, anonymisé)
-#    et le publie sur le topic processed.gps
-# ============================================================
 class KafkaProcessedGpsSink(MapFunction):
-    """
-    Publie chaque event GPS validé + enrichi sur processed.gps.
-    Utilise kafka-python (déjà installé dans le Dockerfile).
-    Clé = taxi_id pour garantir l'ordre par véhicule.
-    """
+    # ✅ BUG 2 + 3 CORRIGÉS : plus de get_zone(), on publie vraiment sur Kafka
 
     def open(self, runtime_context):
         from kafka import KafkaProducer
@@ -207,7 +180,6 @@ class KafkaProcessedGpsSink(MapFunction):
             bootstrap_servers=KAFKA_BROKERS,
             value_serializer=lambda v: v.encode("utf-8"),
             key_serializer=lambda k: str(k).encode("utf-8"),
-            # Fiabilité : attendre acknowledgement du broker
             acks=1,
             retries=3,
         )
@@ -215,14 +187,12 @@ class KafkaProcessedGpsSink(MapFunction):
 
     def map(self, event):
         try:
-            # Message processed.gps = event enrichi complet
-            # (zone_id, zone_name, lat/lon anonymisés déjà appliqués)
             processed_event = {
                 "taxi_id":        event.get("taxi_id"),
                 "timestamp":      event.get("timestamp"),
                 "timestamp_unix": event.get("timestamp_unix"),
-                "lat":            event.get("lat"),          # anonymisé (centroïde)
-                "lon":            event.get("lon"),          # anonymisé (centroïde)
+                "lat":            event.get("lat"),
+                "lon":            event.get("lon"),
                 "zone_id":        event.get("zone_id"),
                 "zone_name":      event.get("zone_name"),
                 "zone_type":      event.get("zone_type"),
@@ -231,10 +201,10 @@ class KafkaProcessedGpsSink(MapFunction):
                 "status":         event.get("status"),
                 "trip_progress":  event.get("trip_progress", 0.0),
                 "road_snapped":   event.get("road_snapped", False),
-                # Champ ajouté pour indiquer que c'est un event normalisé
                 "processed":      True,
                 "processed_at":   datetime.utcnow().isoformat(),
             }
+            # ✅ On publie vraiment sur Kafka
             self.producer.send(
                 "processed.gps",
                 key=event.get("taxi_id"),
@@ -253,13 +223,9 @@ class KafkaProcessedGpsSink(MapFunction):
             self.producer.flush()
             self.producer.close()
 
-# ============================================================
-# 6. Main
-# ============================================================
 def main():
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(1)
-
     env.enable_checkpointing(60000)
     env.get_checkpoint_config().set_checkpointing_mode(CheckpointingMode.EXACTLY_ONCE)
     env.get_checkpoint_config().set_min_pause_between_checkpoints(30000)
@@ -270,7 +236,7 @@ def main():
     print("🚀 TaaSim - Flink Job 1 — GPS Normalizer")
     print("   raw.gps → validation → zone mapping → anonymisation")
     print("   → Cassandra: vehicle_positions")
-    print("   → Kafka:     processed.gps  ← NOUVEAU")
+    print("   → Kafka:     processed.gps")
     print("=" * 60)
 
     kafka_source = (
@@ -295,18 +261,15 @@ def main():
     gps_stream = (
         env
         .from_source(kafka_source, watermark_strategy, "KafkaGPSSource")
-        .map(ParseGpsEvent(),      output_type=Types.PICKLED_BYTE_ARRAY())
+        .map(ParseGpsEvent(),       output_type=Types.PICKLED_BYTE_ARRAY())
         .filter(ValidEvent())
         .map(ZoneMappingFunction(), output_type=Types.PICKLED_BYTE_ARRAY())
     )
 
-    # Pipeline dual sink :
-    #   1. CassandraSinkMap  → écrit vehicle_positions, passe l'event
-    #   2. KafkaProcessedGpsSink → publie sur processed.gps, retourne log string
     (
         gps_stream
-        .map(CassandraSinkMap(),         output_type=Types.PICKLED_BYTE_ARRAY())
-        .map(KafkaProcessedGpsSink(),    output_type=Types.STRING())
+        .map(CassandraSinkMap(),      output_type=Types.PICKLED_BYTE_ARRAY())
+        .map(KafkaProcessedGpsSink(), output_type=Types.STRING())
         .print()
     )
 

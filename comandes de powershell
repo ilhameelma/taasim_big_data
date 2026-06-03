@@ -28,13 +28,17 @@ pour arreter un job
 pour Relancer le job(3 par example) modifié
     docker cp flink/flink_job3_trip_matcher.py  taasim-flink-jobmanager:/opt/flink/flink_job3_trip_matcher.py
     docker exec -it taasim-flink-jobmanager flink run -py /opt/flink/jobs/flink_job3_trip_matcher.py
+Pour verifer les unmatcher.tripps
+    docker exec -it taasim-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic unmatched.trips
+pour verifer matched.processed 
+    docker exec -it taasim-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic processed.matches
 
 pour Lister les topics Kafka existants
     docker exec -it taasim-kafka /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
 # 1. Créer le répertoire jobs dans le conteneur
 docker exec -it taasim-spark-master mkdir -p /opt/spark/jobs
 
-# 2. Copier le script
+# 2. Coùpier le script
 docker cp spark-jobs/etl_porto.py taasim-spark-master:/opt/spark/jobs/etl_porto.py
 
 # 3. Vérifier que le fichier est bien présent
