@@ -59,3 +59,20 @@ CREATE TABLE IF NOT EXISTS kpi_metrics (
     coverage_gap  boolean,
     PRIMARY KEY ((city, zone_id), year_week)
 ) WITH CLUSTERING ORDER BY (year_week DESC);
+
+semaine 5
+# 1. Copier d'abord dans /tmp (pas de problème de permission)
+docker cp spark-jars/hadoop-aws-3.3.4.jar taasim-spark-master:/tmp/
+docker cp spark-jars/aws-java-sdk-bundle-1.12.262.jar taasim-spark-master:/tmp/
+
+# 2. Puis déplacer depuis /tmp avec les bonnes permissions
+docker exec -it taasim-spark-master bash -c "mkdir -p /opt/spark/jars/extras && cp /tmp/*.jar /opt/spark/jars/extras/ && chmod 644 /opt/spark/jars/extras/*.jar"
+
+# 3. Vérifier
+docker exec -it taasim-spark-master ls -la /opt/spark/jars/extras/
+
+lancer spark analysis 
+docker exec -it taasim-jupyter spark-submit `
+  --master spark://spark-master:7077 `
+  --jars /home/jovyan/work/jars/spark-cassandra-connector-assembly_2.12-3.4.1.jar,/home/jovyan/work/jars/hadoop-aws-3.3.4.jar,/home/jovyan/work/jars/aws-java-sdk-bundle-1.12.262.jar `
+  /home/jovyan/work/spark-jobs/kpi_analytics.py

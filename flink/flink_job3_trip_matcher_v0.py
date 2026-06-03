@@ -432,6 +432,7 @@ class CassandraTripSink(MapFunction):
                 pass
 
 
+<<<<<<< HEAD
 class MinIOArchiveSink(MapFunction):
     """Archive les match events dans MinIO raw/kafka-archive/processed.matches/"""
     
@@ -485,6 +486,8 @@ class MinIOArchiveSink(MapFunction):
         # Flush final à la fermeture
         self._flush()
 
+=======
+>>>>>>> 90a31376a6591c75d804411da3621743e99542a1
 # ============================================================
 # 4. MAIN
 # ============================================================
@@ -552,7 +555,10 @@ def main():
     # Sinks
     match_stream = match_stream.map(KafkaMatchSink(), output_type=Types.STRING())
     match_stream = match_stream.map(CassandraTripSink(), output_type=Types.STRING())
+<<<<<<< HEAD
     match_stream = match_stream.map(MinIOArchiveSink(), output_type=Types.STRING()) 
+=======
+>>>>>>> 90a31376a6591c75d804411da3621743e99542a1
     match_stream.print()
     
     print("▶️  Démarrage du Job 3 (KeyedCoProcessFunction)...")

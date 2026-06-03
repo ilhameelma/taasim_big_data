@@ -175,10 +175,13 @@ class TripMatcherCoProcess(KeyedCoProcessFunction):
 
         self.adjacent_zones, self.zone_centroids, self.zone_distances = \
             load_zone_mapping_from_minio()
+<<<<<<< HEAD
         
         print(f"🔍 Zones adjacentes chargées: {list(self.adjacent_zones.keys())[:5]}...")
         print(f"🔍 Zone 2 adjacente à: {self.adjacent_zones.get(2, [])}")
         print(f"🔍 Zone 1 adjacente à: {self.adjacent_zones.get(1, [])}")
+=======
+>>>>>>> 90a31376a6591c75d804411da3621743e99542a1
 
         print("✅ TripMatcherCoProcess initialisé")
 
@@ -374,6 +377,7 @@ class TripMatcherCoProcess(KeyedCoProcessFunction):
 
     def _latency_ms(self, requested_at_str):
         try:
+<<<<<<< HEAD
             # Nettoyer la chaîne : remplacer 'Z' si présent, sinon ajouter '+00:00'
             clean_str = requested_at_str.replace('Z', '+00:00')
             if 'Z' not in requested_at_str and '+' not in requested_at_str:
@@ -385,6 +389,11 @@ class TripMatcherCoProcess(KeyedCoProcessFunction):
             return latency_ms
         except Exception as e:
             print(f"❌ Erreur calcul latence: {e}")  # Affiche l'erreur au lieu de silence
+=======
+            req = datetime.fromisoformat(requested_at_str.replace("Z", "+00:00"))
+            return int((datetime.now(timezone.utc) - req).total_seconds() * 1000)
+        except Exception:
+>>>>>>> 90a31376a6591c75d804411da3621743e99542a1
             return 0
 
 
