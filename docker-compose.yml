@@ -409,6 +409,7 @@ services:
       - ./flink:/home/jovyan/work/flink
       - ./requirements.txt:/home/jovyan/requirements.txt
       - ./spark-jars:/home/jovyan/work/jars
+      - ./ml:/home/jovyan/work/ml
     networks:
       - taasim-net
     command: >
