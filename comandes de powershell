@@ -91,3 +91,4 @@ $prediction = Invoke-RestMethod -Uri "http://localhost:8000/api/demand/forecast"
 $prediction | ConvertTo-Json
 
 autre model de teste du API de prediction ;  http://localhost:8000/docs 
+installer le packages pour l'authauntifacation  pip install python-jose[cryptography] passlib[bcrypt]
