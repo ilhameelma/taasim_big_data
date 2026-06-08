@@ -384,6 +384,7 @@ services:
                           
     ports:
       - "8888:8888"
+      - "8000:8000"        # Port pour FastAPI (Semaine 6+)
     environment:
       JUPYTER_ENABLE_LAB: "yes"
       GRANT_SUDO: "yes"                 # ← AJOUTER CETTE LIGNE
@@ -410,6 +411,7 @@ services:
       - ./requirements.txt:/home/jovyan/requirements.txt
       - ./spark-jars:/home/jovyan/work/jars
       - ./ml:/home/jovyan/work/ml
+      - ./api:/home/jovyan/work/api 
     networks:
       - taasim-net
     command: >
@@ -464,6 +466,4 @@ services:
         condition: service_healthy
     networks:
       - taasim-net
-    # Commenter ce service jusqu'à la Semaine 6
-    profiles:
-      - week6
+

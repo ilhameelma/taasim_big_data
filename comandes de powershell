@@ -76,3 +76,18 @@ docker exec -it taasim-jupyter spark-submit `
   --master spark://spark-master:7077 `
   --jars /home/jovyan/work/jars/spark-cassandra-connector-assembly_2.12-3.4.1.jar,/home/jovyan/work/jars/hadoop-aws-3.3.4.jar,/home/jovyan/work/jars/aws-java-sdk-bundle-1.12.262.jar `
   /home/jovyan/work/spark-jobs/kpi_analytics.py
+
+# Test de prédiction pour la zone 3 à 14h30
+$body = @{
+    zone_id = 3
+    datetime = "2026-06-05T14:30:00"
+} | ConvertTo-Json
+
+$prediction = Invoke-RestMethod -Uri "http://localhost:8000/api/demand/forecast" `
+    -Method Post `
+    -Body $body `
+    -ContentType "application/json"
+
+$prediction | ConvertTo-Json
+
+autre model de teste du API de prediction ;  http://localhost:8000/docs 

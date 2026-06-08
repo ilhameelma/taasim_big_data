@@ -42,3 +42,6 @@ botocore>=1.34.0     # ← AJOUTER CETTE LIGNE
 
 # H3 Spatial Index (RECOMMANDÉ pour performance)
 h3>=3.7.0             # ← À AJOUTER (optionnel mais recommandé)
+
+# Database - Cassandra R
+cassandra-driver>=3.28.0 
