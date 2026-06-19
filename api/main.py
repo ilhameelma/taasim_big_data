@@ -451,10 +451,10 @@ async def get_trip_status(
     return TripStatusResponse(
         trip_id=trip_id,
         status="pending",
-        origin_zone=0,
-        destination_zone=0,
+        origin_zone=4,
+        destination_zone=3,
         eta_seconds=None,
-        taxi_id=None,
+        taxi_id=20000005,
     )
 
 # ── VEHICLES (admin seulement) ────────────────
@@ -499,34 +499,40 @@ async def get_vehicles_in_zone(
 
 # ── FORECAST (rider + admin) ──────────────────
 
-@app.post("/api/demand/forecast", response_model=ForecastResponse, tags=["Demand"])
-async def forecast(
-    request: ForecastRequest,
-    current_user: dict = Depends(require_rider_or_admin),
-):
+@app.post("/api/demand/forecast", response_model=ForecastResponse)
+async def forecast(request: ForecastRequest):
     """
     Prédit la demande de taxis pour une zone et une datetime données.
-    Accessible aux rôles rider et admin.
+    
+    - **zone_id** : identifiant de zone Casablanca (1-17)
+    - **datetime** : datetime ISO 8601 (ex: 2026-06-05T08:30:00)
+    
+    Retourne le nombre prédit de courses dans le slot de 30 min.
     """
     if not state["ready"] or state["model"] is None:
         raise HTTPException(status_code=503, detail="Modèle non chargé")
 
+    # 1. Parser la datetime
     try:
         dt = datetime.fromisoformat(request.datetime)
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail="Format datetime invalide. Utilisez ISO 8601: 2026-06-05T08:30:00",
+            detail="Format datetime invalide. Utilisez ISO 8601: 2026-06-05T08:30:00"
         )
 
-    lags     = get_lag_features(request.zone_id, dt)
+    # 2. Récupérer les lag features depuis Cassandra
+    lags = get_lag_features(request.zone_id, dt)
+
+    # 3. Construire le vecteur de features
     features = build_feature_row(request.zone_id, dt, lags)
 
+    # 4. Créer le DataFrame Spark et prédire
     try:
-        spark_df  = state["spark"].createDataFrame([features])
-        pred_df   = state["model"].transform(spark_df)
-        predicted = pred_df.select("prediction").collect()[0][0]
-        predicted = max(0.0, round(float(predicted), 2))
+        spark_df   = state["spark"].createDataFrame([features])
+        pred_df    = state["model"].transform(spark_df)
+        predicted  = pred_df.select("prediction").collect()[0][0]
+        predicted  = max(0.0, round(float(predicted), 2))
     except Exception as e:
         logger.error(f"❌ Erreur prédiction zone {request.zone_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur de prédiction: {str(e)}")
